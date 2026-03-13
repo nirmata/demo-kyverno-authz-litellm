@@ -6,6 +6,4 @@ metadata:
 data:
   config.yaml: |
 {{ .Values.proxy_config | toYaml | indent 6 }}
-  custom_auth.py: |
-{{ .Files.Get "custom_auth.py" | indent 4 }}
 {{- end }}
