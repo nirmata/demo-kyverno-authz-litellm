@@ -1,0 +1,62 @@
+apiVersion: policies.kyverno.io/v1
+kind: ValidatingPolicy
+metadata:
+  name: litellm-authz
+spec:
+  failurePolicy: Fail
+  evaluation:
+    mode: HTTP
+
+  variables:
+  - name: auth_header
+    expression: object.attributes.header[?"Authorization"].orValue([""])[0]
+  - name: has_token
+    expression: variables.auth_header.startsWith("Bearer ") && variables.auth_header.size() > 10
+  - name: path
+    expression: object.attributes.path
+  - name: method
+    expression: object.attributes.method
+  - name: jwt_sub
+    expression: object.attributes.header[?"X-Jwt-Sub"].orValue([""])[0]
+  - name: jwt_groups
+    expression: object.attributes.header[?"X-Jwt-Groups"].orValue([""])[0]
+  - name: jwt_email
+    expression: object.attributes.header[?"X-Jwt-Email"].orValue([""])[0]
+
+  validations:
+  # 1. Allow health check routes without auth
+  - expression: |
+      variables.path.startsWith("/health") || variables.path == "/ready" || variables.path == "/healthz"
+        ? http.Allowed().Response()
+        : null
+
+  # 2. Deny requests without a Bearer token
+  - expression: |
+      !variables.has_token
+        ? http.Denied("Missing or invalid Bearer token").Response()
+        : null
+
+  # 3. Allow chat completions
+  - expression: |
+      variables.method == "POST" &&
+      (variables.path == "/v1/chat/completions" || variables.path == "/chat/completions")
+        ? http.Allowed().Response()
+        : null
+#    ? http.Denied("Route not allowed by policy").Response()    
+  # 4. Allow key/team/user management routes
+  - expression: |
+      variables.path.startsWith("/key/") || variables.path.startsWith("/team/") ||
+      variables.path.startsWith("/user/") || variables.path.startsWith("/model/")
+        ? http.Allowed().Response()
+        : null
+
+  # 5. Allow UI and model listing
+  - expression: |
+      variables.path.startsWith("/ui") || variables.path == "/models" ||
+      variables.path.startsWith("/v1/models")
+        ? http.Allowed().Response()
+        : null
+
+  # 6. Default deny
+  - expression: |
+      http.Denied("Route not allowed by policy").Response()
