@@ -1,0 +1,71 @@
+#Add the validation for the JWT token expiration
+
+apiVersion: policies.kyverno.io/v1alpha1
+kind: ValidatingPolicy
+metadata:
+  name: policy
+spec:
+  evaluation:
+    mode: HTTP
+  matchConditions:
+  - name: match-host
+    expression: |
+      object.attributes.host == "http-srv.app"
+  validations:
+  - expression: >
+      http.Denied("not allowed").Response()
+  # - expression: >
+  #     object.attributes.request.http.method == "GET" &&
+  #     object.attributes.request.http.path == "/get"
+  #       ? envoy.Allowed().Responsevalidating-policy.yaml()
+  #       : null
+  # - expression: >
+  #     object.attributes.request.http.method == "GET" &&
+  #     object.attributes.request.http.path == "/get"
+  #       ? envoy.Denied(403).Response()
+  #       : null
+
+  # - expression: >
+  #     object.attributes.request.http.method == "GET" &&
+  #     object.attributes.request.http.path == "/get" &&
+  #     "kube-dev" in variables.token.Claims["groups"]
+  #       ? envoy.Denied(403).Response()
+  #       : null
+
+  # - expression: >
+  #     object.attributes.request.http.method == "GET" &&
+  #     object.attributes.request.http.path == "/productpage"
+  #       ? envoy.Allowed().Response()
+  #       : null
+  # gen AI LLM client
+  # - expression: >
+  #     object.attributes.request.http.method == "POST" &&
+  #     object.attributes.request.http.path.startsWith("/gen-ai-llm-client/api/")
+  #       ? envoy.Allowed().Response()
+  #       : null
+  # # authenticated
+  # - expression: >
+  #     variables.token == null || !variables.token.Valid
+  #       ? envoy.Denied(401).Response()
+  #       : null
+  # # gen AI chat recorder service
+  # - expression: >
+  #     object.attributes.request.http.path.startsWith("/gen-ai-llm-chat-recorder/api/") &&
+  #     variables.token.Claims["cognito:groups"] in ["platform_developer", "platform_data_engineer", "platform_tester", "platform_security_engineers"]
+  #       ? envoy.Allowed().Response()
+  #       : null
+  # - expression: >
+  #     object.attributes.request.http.path.startsWith("/gen-ai-llm-chat-recorder/api/") &&
+  #     object.attributes.request.http.method == "GET" &&
+  #     variables.token.Claims["scope"] in ["lcp_microservice/gen-ai-llm-chat-recorder-service.read"]
+  #       ? envoy.Allowed().Response()
+  #       : null
+  # - expression: >
+  #     object.attributes.request.http.path.startsWith("/gen-ai-llm-chat-recorder/api/") &&
+  #     object.attributes.request.http.method in ["POST", "PUT"] &&
+  #     variables.token.Claims["scope"] in ["lcp_microservice/gen-ai-llm-chat-recorder-service.write"]
+  #       ? envoy.Allowed().Response()
+  #       : null
+  # not authorized
+  # - expression: >
+  #     envoy.Denied(401).Response()

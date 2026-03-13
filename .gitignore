@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+venv/
+.venv/
+*.egg
+
+# Helm
+*.tgz
+charts/*.tgz
+
+# IDE / OS
+.idea/
+.DS_Store
+*.swp
+*.swo
+
+# Env / secrets (do not commit)
+.env
+*.pem
+secrets.yaml

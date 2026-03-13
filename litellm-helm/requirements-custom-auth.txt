@@ -1,0 +1,3 @@
+# Dependencies for custom_auth.py (mounted at runtime)
+# Base image already provides: fastapi, litellm
+httpx>=0.27.0
