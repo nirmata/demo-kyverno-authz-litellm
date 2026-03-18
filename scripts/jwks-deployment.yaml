@@ -1,0 +1,52 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: jwks-mock-data
+  namespace: litellm
+data:
+  jwks.json: |
+    PLACEHOLDER
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jwks-mock
+  namespace: litellm
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: jwks-mock
+  template:
+    metadata:
+      labels:
+        app: jwks-mock
+    spec:
+      containers:
+      - name: nginx
+        image: nginx:alpine
+        ports:
+        - containerPort: 80
+        volumeMounts:
+        - name: jwks-data
+          mountPath: /usr/share/nginx/html/.well-known
+          readOnly: true
+      volumes:
+      - name: jwks-data
+        configMap:
+          name: jwks-mock-data
+          items:
+          - key: jwks.json
+            path: jwks.json
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: jwks-mock
+  namespace: litellm
+spec:
+  selector:
+    app: jwks-mock
+  ports:
+  - port: 8080
+    targetPort: 80

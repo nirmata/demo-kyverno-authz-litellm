@@ -2,17 +2,18 @@
 # This is a YAML-formatted file.
 # Declare variables to be passed into your templates.
 
-replicaCount: 1
+replicaCount: 3
 # numWorkers: 2
 
 image:
   # Use "ghcr.io/berriai/litellm-database" for optimized image with database
-  repository: docker.io/sachin787/customlitellm
+  #repository: docker.litellm.ai/berriai/litellm-database
+  repository: anuddeeph/litellm-custom-auth
   pullPolicy: Always
   # Overrides the image tag whose default is the chart appVersion.
   # tag: "main-latest"
-  tag: "v3"
-
+  #tag: "main-stable"
+  tag: "v10"
 imagePullSecrets: []
 nameOverride: "litellm"
 fullnameOverride: ""
@@ -60,18 +61,16 @@ securityContext:
 # A list of Kubernetes Secret objects that will be exported to the LiteLLM proxy
 #  pod as environment variables.  These secrets can then be referenced in the
 #  configuration file (or "litellm" ConfigMap) with `os.environ/<Env Var Name>`
-#  Create a Secret with key GEMINI_API_KEY (or the env name used in proxy_config)
-#  and add its name here so the model api_key is not stored in the ConfigMap.
 environmentSecrets:
-  - litellm-api-keys
-  # - litellm-env-secret
+  - litellm-env-secret
+  # Secret should include: PROXY_MASTER_KEY (recommended format: sk-...), GEMINI_API_KEY, ANTHROPIC_API_KEY
 
 # A list of Kubernetes ConfigMap objects that will be exported to the LiteLLM proxy
 #  pod as environment variables.  The ConfigMap kv-pairs can then be referenced in the
 #  configuration file (or "litellm" ConfigMap) with `os.environ/<Env Var Name>`
 environmentConfigMaps:
-  []
-  # - litellm-env-configmap
+  - litellm-jwt-config
+  # Contains: JWT_JWKS_URL, JWT_ISSUER, JWT_AUDIENCE, JWT_HEADER_NAME
 
 service:
   type: ClusterIP
@@ -107,10 +106,10 @@ ingress:
 # masterkey: changeit
 
 # if set, use this secret for the master key; otherwise, autogenerate a new one
-masterkeySecretName: ""
+masterkeySecretName: "litellm-env-secret"
 
 # if set, use this secret key for the master key; otherwise, use the default key
-masterkeySecretKey: ""
+masterkeySecretKey: "PROXY_MASTER_KEY"
 
 proxyConfigMap:
   # when true, creates a new configmap
@@ -126,17 +125,26 @@ proxyConfigMap:
 proxy_config:
   model_list:
     # At least one model must exist for the proxy to start.
-    # api_key is read from Secret (see environmentSecrets); create a Secret
-    # named litellm-api-keys with key GEMINI_API_KEY.
-    - model_name: gemini-model
+    - model_name: gemini-flash
       litellm_params:
-        model: gemini-3-flash-preview
+        model: gemini/gemini-2.5-flash
         api_key: os.environ/GEMINI_API_KEY
+    - model_name: claude-sonnet-4-5
+      litellm_params:
+        model: anthropic/claude-sonnet-4-5
+        api_key: os.environ/ANTHROPIC_API_KEY
   general_settings:
-    master_key: sk-1234
-    custom_auth: custom_auth.kyverno_auth_handler
+    use_redis_transaction_buffer: true
+    master_key: os.environ/PROXY_MASTER_KEY
+    custom_auth: custom_auth.user_api_key_auth
     custom_auth_settings:
+      #mode: "auto"
       mode: "on"
+  litellm_settings:
+    cache: true
+    cache_params:
+      type: redis
+      host: os.environ/REDIS_HOST
 
 resources:
   {}
@@ -220,10 +228,9 @@ db:
   database: litellm
   url: postgresql://$(DATABASE_USERNAME):$(DATABASE_PASSWORD)@$(DATABASE_HOST)/$(DATABASE_NAME)
   secret:
-    name: postgres
+    name: litellm-dbcredentials
     usernameKey: username
     passwordKey: password
-    # Optional: when set, DATABASE_HOST will be sourced from this secret key instead of db.endpoint
     endpointKey: ""
 
   # Use the Stackgres Helm chart to deploy an instance of a Stackgres cluster.
@@ -247,28 +254,28 @@ lifecycle: {}
 # Settings for Bitnami postgresql chart (if db.deployStandalone is true, ignored
 #  otherwise)
 postgresql:
-  architecture: standalone
+  architecture: replication
   auth:
     username: litellm
     database: litellm
-
-    # You should override these on the helm command line with
-    #  `--set postgresql.auth.postgres-password=<some good password>,postgresql.auth.password=<some good password>`
     password: NoTaGrEaTpAsSwOrD
     postgres-password: NoTaGrEaTpAsSwOrD
-
-    # A secret is created by this chart (litellm-helm) with the credentials that
-    #  the new Postgres instance should use.
-    # existingSecret: ""
-    # secretKeys:
-    #   userPasswordKey: password
+    replicationPassword: NoTaGrEaTpAsSwOrD
+  primary:
+    replicaCount: 1
+  readReplicas:
+    replicaCount: 2
 
 # requires cache: true in config file
 # either enable this or pass a secret for REDIS_HOST, REDIS_PORT, REDIS_PASSWORD or REDIS_URL
 # with cache: true to use existing redis instance
 redis:
-  enabled: false
-  architecture: standalone
+  enabled: true
+  architecture: replication
+  master:
+    replicaCount: 1
+  replica:
+    replicaCount: 2
 
 # Prisma migration job settings
 migrationJob:
@@ -304,8 +311,19 @@ command: {}
 # if you want to override the container args, you can do so here
 args: {}
 
+# - name: EXTRA_ENV_VAR
+#   value: EXTRA_ENV_VAR_VALUE
 # Additional Kubernetes resources to deploy with litellm
-extraResources: []
+# Creates an alias so chart template (litellm-postgresql) resolves to
+# the replication primary service (litellm-postgresql-primary)
+extraResources:
+  - apiVersion: v1
+    kind: Service
+    metadata:
+      name: litellm-postgresql
+    spec:
+      type: ExternalName
+      externalName: litellm-postgresql-primary.litellm.svc.cluster.local
 
 # - apiVersion: v1
 #   kind: ConfigMap

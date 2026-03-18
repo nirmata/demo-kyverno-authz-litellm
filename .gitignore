@@ -21,3 +21,4 @@ charts/*.tgz
 .env
 *.pem
 secrets.yaml
+*-azure.jwt

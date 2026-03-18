@@ -1,0 +1,50 @@
+apiVersion: policies.kyverno.io/v1
+kind: ValidatingPolicy
+metadata:
+  name: litellm-authz
+spec:
+  failurePolicy: Fail
+  evaluation:
+    mode: HTTP
+
+  variables:
+  - name: auth_header
+    expression: object.attributes.header[?"Authorization"].orValue([""])[0]
+  - name: has_token
+    expression: variables.auth_header.startsWith("Bearer ") && variables.auth_header.size() > 10
+  - name: path
+    expression: object.attributes.path
+  - name: method
+    expression: object.attributes.method
+  - name: jwt_sub
+    expression: object.attributes.header[?"X-Jwt-Sub"].orValue([""])[0]
+  - name: jwt_groups
+    expression: object.attributes.header[?"X-Jwt-Groups"].orValue([""])[0]
+  - name: jwt_email
+    expression: object.attributes.header[?"X-Jwt-Email"].orValue([""])[0]
+
+  validations:
+  # 1. Allow health check routes without auth
+  - expression: |
+      variables.path.startsWith("/health") || variables.path == "/ready" || variables.path == "/healthz"
+        ? http.Allowed().Response()
+        : null
+
+  # 2. Deny requests without a Bearer token
+  - expression: |
+      !variables.has_token
+        ? http.Denied("Missing or invalid Bearer token").Response()
+        : null
+
+  # 3. All authenticated requests are allowed through Kyverno.
+  #    Fine-grained checks (model access, budget, team/user scoping, JWT
+  #    identity binding) are enforced by custom_auth.py and LiteLLM's
+  #    internal auth pipeline.
+  - expression: |
+      variables.has_token
+        ? http.Allowed().Response()
+        : null
+
+  # 4. Default deny (unreachable — kept as safety net)
+  - expression: |
+      http.Denied("Route not allowed by policy").Response()
