@@ -15,17 +15,17 @@ A production-grade AI gateway that unifies multiple LLM providers behind a singl
                                        │
                                        ▼
 ┌──────────────────────────────────────────────────────────────────────────────┐
-│  LiteLLM Proxy (3 replicas, image: anuddeeph/litellm-custom-auth:v8)        │
+│  LiteLLM Proxy (3 replicas, image: anuddeeph/litellm-custom-auth:v9)        │
 │                                                                              │
 │  ┌────────────────────────────────────────────────────────────────────────┐  │
 │  │  custom_auth.py (Phase 1: JWT Identity Binding)                        │  │
 │  │                                                                        │  │
 │  │  1. Health probe? ──────────────────────────────► bypass (master key)  │  │
 │  │  2. Master key?   ──────────────────────────────► bypass (no JWT)     │  │
-│  │  3. Validate JWT (sig, exp, iss, aud) ──────────► 401 if invalid     │  │
-│  │  4. Forward to Kyverno (+ X-Jwt-Sub header) ───► 403 if denied      │  │
-│  │  5. Key ownership: JWT.sub == key.user_id? ─────► 403 if mismatch   │  │
-│  │  6. Return api_key string for DB lookup                               │  │
+│  │  3. Inference route?                                                   │  │
+│  │     YES → Validate JWT → Kyverno (+ claims) → key ownership check    │  │
+│  │     NO  → Kyverno (route check only) → LiteLLM DB auth              │  │
+│  │  4. Return api_key string for DB lookup                               │  │
 │  └────────────────────────────────────────────────────────────────────────┘  │
 │                                                                              │
 │  LiteLLM Internal Auth                                                       │
@@ -46,11 +46,21 @@ A production-grade AI gateway that unifies multiple LLM providers behind a singl
 
 | Layer | Component | Responsibility |
 |-------|-----------|----------------|
-| Identity | JWT validation (PyJWT + JWKS) | Verify caller identity. Reject expired/invalid/missing tokens. |
-| Policy | Kyverno Authz Server | Route access, token presence, method checks. JWT claims available as `X-Jwt-Sub`, `X-Jwt-Groups` for future claim-based rules. |
+| Identity | JWT validation (PyJWT + JWKS) | Verify caller identity on inference routes. Reject expired/invalid/missing tokens. |
+| Policy | Kyverno Authz Server | Coarse-grained gate: reject unauthenticated requests (no Bearer token). JWT claims forwarded as `X-Jwt-Sub`, `X-Jwt-Groups` for future claim-based rules. |
 | Access Control | LiteLLM Internal Auth | Token validity (DB lookup), model access, budget enforcement, team/user scoping, spend tracking. |
 
-In addition, `custom_auth.py` performs a **key ownership check**: the JWT `sub` claim must match the virtual key's `user_id`. This prevents cross-user key theft even when teams share the same model permissions.
+In addition, `custom_auth.py` performs a **key ownership check** on inference routes: the JWT `sub` claim must match the virtual key's `user_id`. This prevents cross-user key theft even when teams share the same model permissions.
+
+### Route Classification in custom_auth.py
+
+| Route type | Examples | JWT required? | Key ownership check? | Kyverno check? |
+|------------|----------|---------------|---------------------|----------------|
+| Health | `/health/readiness`, `/healthz` | No (bypass) | No | No |
+| Master key | Any route with master key | No (bypass) | No | No |
+| Inference | `/v1/chat/completions`, `/v1/embeddings` | **Yes** | **Yes** | Yes (with JWT claims) |
+| Management | `/key/*`, `/team/*`, `/user/*`, `/model/*` | No | No | Yes (token presence) |
+| UI / SSO | `/ui/*`, `/sso/*`, `/login`, `/global/*`, `/config/*` | No | No | Yes (token presence) |
 
 ---
 
@@ -82,6 +92,7 @@ AI-auth/
 │   └── ...                            # LiteLLM Helm chart templates
 └── scripts/
     ├── generate_test_jwt.py           # Generate RSA keys + test JWTs for local testing
+    ├── test_jwt_identity.sh           # Automated test suite (7 tests)
     ├── jwks-deployment.yaml           # Kubernetes nginx deployment serving JWKS
     └── keys/
         ├── private.pem                # RSA-2048 private key (test only)
@@ -91,7 +102,9 @@ AI-auth/
 
 ---
 
-## Request Flow (with JWT Identity Binding)
+## Request Flow
+
+### Inference Route (with JWT Identity Binding)
 
 ```
 1. Client sends:
@@ -101,6 +114,7 @@ AI-auth/
 
 2. custom_auth.py:
    ├── Not a health route, not master key
+   ├── Path matches INFERENCE_PREFIXES → JWT required
    ├── Extract JWT from X-Identity-Token header
    ├── Validate JWT via PyJWKClient:
    │     ├── Fetch JWKS from http://jwks-mock:8080/.well-known/jwks.json
@@ -117,9 +131,8 @@ AI-auth/
 3. Kyverno Authz Server:
    ├── Parses raw bytes via Go's httputil.ReadRequest
    ├── Evaluates ValidatingPolicy (CEL):
-   │     ├── Has Bearer token? YES
-   │     ├── POST /v1/chat/completions? YES
-   │     └── → http.Allowed()
+   │     ├── Has Bearer token? YES → Allowed
+   │     └── (JWT claims available for future claim-based rules)
    └── Returns 200
 
 4. custom_auth.py — key ownership check:
@@ -137,6 +150,26 @@ AI-auth/
    └── Forward to Gemini API (using real GEMINI_API_KEY)
 
 7. Response returned to client, spend recorded
+```
+
+### Management / UI Route (no JWT needed)
+
+```
+1. Browser / UI sends:
+     GET /global/spend/teams
+     Authorization: Bearer sk-session... (UI session key)
+
+2. custom_auth.py:
+   ├── Not a health route, not master key
+   ├── Path does NOT match INFERENCE_PREFIXES → skip JWT
+   ├── Build raw HTTP/1.1 bytes (no JWT claims injected)
+   └── POST raw bytes → Kyverno Authz Server :9081
+
+3. Kyverno: Has Bearer token? YES → Allowed (200)
+
+4. custom_auth.py: skip key ownership check (not inference)
+
+5. Return "sk-session..." string → LiteLLM DB lookup → authorize
 ```
 
 ---
@@ -212,6 +245,7 @@ kubectl create namespace litellm
 kubectl create secret generic litellm-env-secret \
   -n litellm \
   --from-literal=PROXY_MASTER_KEY='sk-your-master-key-here' \
+  --from-literal=LITELLM_MASTER_KEY='sk-your-master-key-here' \
   --from-literal=GEMINI_API_KEY='your-gemini-key' \
   --from-literal=ANTHROPIC_API_KEY='your-anthropic-key'
 
@@ -246,7 +280,7 @@ kubectl create configmap litellm-jwt-config \
 ```bash
 docker buildx build \
   --platform linux/amd64,linux/arm64 \
-  --tag <your-registry>/litellm-custom-auth:v8 \
+  --tag <your-registry>/litellm-custom-auth:v9 \
   --push .
 ```
 
@@ -255,6 +289,7 @@ Update `litellm-helm/values.yaml` with your image repository and tag.
 ### 7. Deploy LiteLLM
 
 ```bash
+kubectl delete job litellm-migrations -n litellm --ignore-not-found
 helm upgrade --install litellm ./litellm-helm \
   -f ./litellm-helm/values.yaml \
   -n litellm
@@ -299,39 +334,40 @@ Teams with identical model permissions — isolation enforced by JWT identity bi
 | team-c | user-c | gemini-flash, claude-sonnet-4-5 | $10 |
 | team-d | user-d | gemini-flash, claude-sonnet-4-5 | $10 |
 
-**Test results (Phase 1 — JWT required):**
+**Test results (Phase 1 — JWT required on inference routes):**
 
-| Test | JWT | Key | Result |
-|------|-----|-----|--------|
-| user-c JWT + user-c key | user-c | user-c | **Allowed** — "jwt identity works" |
-| user-d JWT + user-d key | user-d | user-d | **Allowed** — "user-d claude ok" |
-| user-d JWT + user-c key | user-d | user-c | **Denied** — "JWT sub 'user-d' does not match key owner 'user-c'" |
-| user-c JWT + user-d key | user-c | user-d | **Denied** — "JWT sub 'user-c' does not match key owner 'user-d'" |
-| No JWT + virtual key | none | user-c | **Denied** — "Missing identity token in X-Identity-Token header" |
-| Invalid JWT + key | fake | user-c | **Denied** — "Unable to find a signing key" |
-| Master key, no JWT | admin | master | **Allowed** — admin bypass |
+| # | Test | JWT | Key | Result |
+|---|------|-----|-----|--------|
+| 1 | user-c JWT + user-c key → gemini | user-c | user-c | **Allowed** — "jwt identity works" |
+| 2 | user-d JWT + user-c key | user-d | user-c | **Denied** — "JWT sub 'user-d' does not match key owner 'user-c'" |
+| 3 | No JWT + virtual key | none | user-c | **Denied** — "Missing identity token in X-Identity-Token header" |
+| 4 | Master key, no JWT | admin | master | **Allowed** — admin bypass |
+| 5 | user-d JWT + user-d key → claude | user-d | user-d | **Allowed** — "user-d claude ok" |
+| 6 | user-c JWT + user-d key | user-c | user-d | **Denied** — "JWT sub 'user-c' does not match key owner 'user-d'" |
+| 7 | Invalid/fake JWT + key | fake | user-c | **Denied** — "Unable to find a signing key" |
 
-### How to reproduce the tests
+### Scenario C: UI / Management Access (no JWT needed)
+
+After the v9 fix, management and UI routes work with just a session key — no JWT required.
+
+| # | Test | Result |
+|---|------|--------|
+| 8 | UI login (form POST /login with master key) | **Allowed** — returns session cookie with 303 redirect |
+| 9 | UI session key → /user/info | **Allowed** — 200 OK |
+| 10 | UI session key → /global/spend/teams | **Allowed** — 200 OK |
+| 11 | UI session key → /v2/model/info | **Allowed** — 200 OK |
+| 12 | UI session key → /config/list | **Allowed** — 200 OK |
+| 13 | UI session key → /organization/list | **Allowed** — 200 OK |
+
+### How to run the automated tests
 
 ```bash
 export PROXY_MASTER_KEY=$(kubectl get secret -n litellm litellm-env-secret \
   -o jsonpath='{.data.PROXY_MASTER_KEY}' | base64 -d)
-export JWT_C=$(cat scripts/keys/user-c.jwt)
-export JWT_D=$(cat scripts/keys/user-d.jwt)
+export KEY_USER_C="sk-..."   # virtual key owned by user-c
+export KEY_USER_D="sk-..."   # virtual key owned by user-d
 
-# user-c JWT + user-c key → should work
-curl -s -X POST "http://127.0.0.1:4000/v1/chat/completions" \
-  -H "Authorization: Bearer <user-c-key>" \
-  -H "X-Identity-Token: $JWT_C" \
-  -H "Content-Type: application/json" \
-  -d '{"model":"gemini-flash","messages":[{"role":"user","content":"test"}]}'
-
-# user-d JWT + user-c key → should be denied (owner mismatch)
-curl -s -X POST "http://127.0.0.1:4000/v1/chat/completions" \
-  -H "Authorization: Bearer <user-c-key>" \
-  -H "X-Identity-Token: $JWT_D" \
-  -H "Content-Type: application/json" \
-  -d '{"model":"gemini-flash","messages":[{"role":"user","content":"test"}]}'
+bash scripts/test_jwt_identity.sh
 ```
 
 ---
@@ -371,7 +407,7 @@ curl -s -X POST "http://127.0.0.1:4000/team/member_add" \
 
 ### Admin UI
 
-Access at `http://127.0.0.1:4000/ui` — login with the master key as the password.
+Access at `http://127.0.0.1:4000/ui` — login with username `admin` and the master key as the password (form-encoded POST).
 
 ---
 
@@ -467,7 +503,7 @@ Access at `http://127.0.0.1:4000/ui` — login with the master key as the passwo
 
 **Symptom:** `undefined field 'request'` in CEL expression `object.attributes.request.http.headers`
 
-**Root Cause:** Envoy mode uses `object.attributes.request.http.headers`. HTTP mode uses flat `object.attributes.header`, `.path`, `.method`.
+**Root Cause:** Envoy mode uses `object.attributes.request.http.headers`. HTTP mode with `nestedRequest: true` uses a flat structure: `object.attributes.header`, `.path`, `.method`.
 
 **Fix:** Changed all CEL expressions to use the HTTP mode object structure.
 
@@ -477,9 +513,9 @@ Access at `http://127.0.0.1:4000/ui` — login with the master key as the passwo
 
 **Symptom:** `found no matching overload for 'orValue' applied to 'optional_type(list(string)).(string)'`
 
-**Root Cause:** With `nestedRequest: true`, headers are `map[string][]string`. The optional wraps `list(string)`, not `string`.
+**Root Cause:** With `nestedRequest: true`, Go's `http.Header` is `map[string][]string`. The optional wraps `list(string)`, not `string`. Using `.orValue("")` (string default) fails against a list type.
 
-**Fix:** `object.attributes.header[?"Authorization"].orValue([""])[0]` — default to empty list, take first element.
+**Fix:** `object.attributes.header[?"Authorization"].orValue([""])[0]` — default to an empty list, take the first element.
 
 ---
 
@@ -515,13 +551,13 @@ Access at `http://127.0.0.1:4000/ui` — login with the master key as the passwo
 
 ### Issue 15: LiteLLM Strips Authorization Header Before Custom Auth
 
-**Symptom:** After adding JWT validation (v8), Kyverno received `Authorization: Bearer` without the actual token (auth_len=6). JWT claims (X-Jwt-Sub) forwarded correctly.
+**Symptom:** After adding JWT validation (v8), Kyverno received `Authorization: Bearer` without the actual token value (`auth_len=6`). JWT claims (`X-Jwt-Sub`) forwarded correctly.
 
-**Root Cause:** LiteLLM's middleware extracts the Bearer token from the `Authorization` header and passes it as the `api_key` parameter. The `request.headers["authorization"]` value is left as just `"Bearer"` (stripped of the actual token).
+**Root Cause:** LiteLLM's middleware extracts the Bearer token from the `Authorization` header and passes it as the `api_key` parameter to `custom_auth.py`. The `request.headers["authorization"]` value is left as just `"Bearer"` (stripped of the actual token).
 
-**Diagnosis:** Deployed a debug Kyverno policy that returned header values: `auth_len=6` confirmed the token was missing.
+**Diagnosis:** Deployed a debug Kyverno policy that returned header values in the denial message: `auth_len=6` confirmed the token was stripped.
 
-**Fix:** In `_build_raw_http_request`, skip the original `authorization` header and explicitly inject a fresh one from the `api_key` parameter:
+**Fix:** In `_build_raw_http_request`, skip the original `authorization` header from `request.headers` and explicitly inject a fresh one from the `api_key` parameter:
 
 ```python
 lines.append(f"Authorization: Bearer {api_key}")
@@ -530,6 +566,74 @@ for key, value in request.headers.items():
         continue
     lines.append(f"{key}: {value}")
 ```
+
+---
+
+### Issue 16: JWT Required on All Routes Broke the Admin UI (v8 → v9)
+
+**Symptom:** After logging into the UI (`/ui/?login=success`), every page showed `{"error":{"message":"Missing identity token in X-Identity-Token header"}}`. The UI was completely non-functional despite login succeeding.
+
+**Root Cause:** In v8, `custom_auth.py` required a JWT (`X-Identity-Token` header) on **every** non-health, non-master-key request. After a UI login, LiteLLM generates an internal session key (not the master key) and uses it for all subsequent API calls (`/user/info`, `/model/info`, `/global/spend/*`, etc.). The UI does not send a JWT — it only sends the session key in the `Authorization` header.
+
+**Fix (v9):** Introduced an `INFERENCE_PREFIXES` tuple in `custom_auth.py` that lists inference routes (`/v1/chat/completions`, `/v1/embeddings`, etc.). JWT validation and key ownership checks are now enforced **only** on inference routes. Management and UI routes pass through to Kyverno (token presence check) and LiteLLM's internal DB auth without requiring a JWT:
+
+```python
+INFERENCE_PREFIXES = (
+    "/v1/chat/completions", "/chat/completions",
+    "/v1/completions", "/completions",
+    "/v1/embeddings", "/embeddings",
+    "/v1/images", "/v1/audio", "/v1/moderations",
+)
+
+is_inference = any(path.startswith(p) for p in INFERENCE_PREFIXES)
+
+if is_inference:
+    # validate JWT, extract claims, check key ownership
+    ...
+else:
+    # skip JWT — Kyverno checks token presence, LiteLLM checks DB validity
+    ...
+```
+
+---
+
+### Issue 17: UI Login Returns "Invalid Credentials" (LITELLM_MASTER_KEY Missing)
+
+**Symptom:** POST to `/login` with `username=admin` and `password=<master-key>` returned `{"error":{"message":"Invalid credentials used to access UI.\nCheck 'UI_USERNAME', 'UI_PASSWORD' in .env file"}}`.
+
+**Root Cause:** LiteLLM's `/login` endpoint calls `get_ui_credentials(master_key)` where `master_key` is the proxy's internal global variable. During startup, LiteLLM resolves this from `general_settings.master_key` (which is `os.environ/PROXY_MASTER_KEY`). However, an earlier startup path also calls `get_secret_str("LITELLM_MASTER_KEY")`. The UI password defaults to the master key value. The `litellm-env-secret` only contained `PROXY_MASTER_KEY` but not `LITELLM_MASTER_KEY`.
+
+**Diagnosis:** Checked inside the pod: `LITELLM_MASTER_KEY=NOT SET`, `UI_USERNAME=NOT SET`, `UI_PASSWORD=NOT SET`. The login form expects `application/x-www-form-urlencoded` (not JSON).
+
+**Fix:** Added `LITELLM_MASTER_KEY` to the `litellm-env-secret` with the same value as `PROXY_MASTER_KEY`:
+
+```bash
+kubectl patch secret litellm-env-secret -n litellm \
+  --type='json' \
+  -p='[{"op":"add","path":"/data/LITELLM_MASTER_KEY","value":"<base64-encoded-key>"}]'
+```
+
+---
+
+### Issue 18: Kyverno Policy Default-Deny Blocked 50+ UI Internal Routes
+
+**Symptom:** After fixing issues 16 and 17, the UI login succeeded but most tabs showed errors. Logs showed 403s on routes like `/global/spend/teams`, `/config/list`, `/v2/model/info`, `/organization/list`, `/schedule/model_cost_map_reload/status`, `/budget/list`, `/credentials`, `/router/settings`, and 50+ others.
+
+**Root Cause:** The Kyverno ValidatingPolicy had an explicit allow-list of routes (rules 3-5: chat completions, `/key/*`, `/team/*`, `/user/*`, `/model/*`, `/ui/*`), followed by a default deny (rule 6). The LiteLLM UI makes internal API calls to dozens of routes not in this allow-list (`/global/*`, `/config/*`, `/v2/*`, `/schedule/*`, `/spend/*`, `/budget/*`, `/organization/*`, `/guardrails/*`, `/policies/*`, `/credentials`, etc.).
+
+**Fix:** Simplified the Kyverno policy from a route-level allow-list to an **authentication gate**:
+
+```yaml
+# Old approach (5 route-matching rules + default deny)
+# → broke on every new UI route
+
+# New approach (3 rules):
+# 1. Allow health routes without auth
+# 2. Deny requests without a Bearer token
+# 3. Allow all authenticated requests
+```
+
+The rationale: Kyverno's role is **coarse-grained** — it only needs to reject unauthenticated requests. Fine-grained authorization (model access, budget, team scoping, JWT identity) is handled by `custom_auth.py` and LiteLLM's internal auth pipeline. The JWT claim variables (`jwt_sub`, `jwt_groups`, `jwt_email`) remain in the policy for future claim-based rules.
 
 ---
 
@@ -565,3 +669,4 @@ See [AUTHZ_LAYER_ARCHITECTURE.md](./AUTHZ_LAYER_ARCHITECTURE.md) for the full Az
 | v6 | Stabilized custom_auth_settings mode: "on" |
 | v7 | Fixed CRLF encoding in raw HTTP bytes |
 | v8 | Phase 1: JWT identity binding (PyJWT + JWKS + key ownership check + Authorization header reconstruction) |
+| v9 | Scoped JWT to inference routes only; UI/management routes pass through without JWT (fixes Issues 16-18) |
