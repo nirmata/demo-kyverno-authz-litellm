@@ -603,54 +603,67 @@ bash scripts/test_jwt_identity.sh
 
 All tests run with real Azure AD tokens from 3 users. Test script: `scripts/test_azure_oidc.sh`.
 
+### All 18 Tests — Summary Table
+
+| # | Scenario | Test | JWT user | Key / Key owner | Expected | Result |
+|---|----------|------|----------|-----------------|----------|--------|
+| A1 | A: Model isolation | Anudeep JWT + litellm-team-a key → gemini | Anudeep (OID `80fa6a56...`) | litellm-team-a / Anudeep | Allowed | **PASS** — 200, model responded |
+| A2 | A: Model isolation | Anudeep JWT + litellm-team-a key → claude | Anudeep (OID `80fa6a56...`) | litellm-team-a / Anudeep | Denied | **PASS** — 401, "key not allowed to access model" |
+| A3 | A: Model isolation | Sachin JWT + litellm-team-b key → claude | Sachin (OID `91c0c55c...`) | litellm-team-b / Sachin | Allowed | **PASS** — 200, model responded |
+| A4 | A: Model isolation | Sachin JWT + litellm-team-b key → gemini | Sachin (OID `91c0c55c...`) | litellm-team-b / Sachin | Denied | **PASS** — 401, "key not allowed to access model" |
+| A5 | A: Model isolation | Anudeep JWT + Sachin's litellm-team-b key | Anudeep (OID `80fa6a56...`) | litellm-team-b / Sachin | Denied | **PASS** — 403, "does not match key owner" |
+| A6 | A: Model isolation | Sachin JWT + Anudeep's litellm-team-a key | Sachin (OID `91c0c55c...`) | litellm-team-a / Anudeep | Denied | **PASS** — 403, "does not match key owner" |
+| B1 | B: JWT identity | Anudeep JWT + Anudeep litellm-team-c key → gemini | Anudeep (OID `80fa6a56...`) | litellm-team-c / Anudeep | Allowed | **PASS** — 200, model responded |
+| B2 | B: JWT identity | Rahul JWT + Anudeep litellm-team-c key | Rahul (OID `8ca1dc25...`) | litellm-team-c / Anudeep | Denied | **PASS** — 403, "JWT sub '8ca1dc25...' does not match key owner '80fa6a56...'" |
+| B3 | B: JWT identity | No JWT + Anudeep litellm-team-c key | none | litellm-team-c / Anudeep | Denied | **PASS** — 401, "Missing identity token in X-Identity-Token header" |
+| B4 | B: JWT identity | Master key, no JWT | admin | master key | Allowed | **PASS** — 200, admin bypass |
+| B5 | B: JWT identity | Rahul JWT + Rahul litellm-team-d key → claude | Rahul (OID `8ca1dc25...`) | litellm-team-d / Rahul | Allowed | **PASS** — 200, model responded |
+| B6 | B: JWT identity | Anudeep JWT + Rahul litellm-team-d key | Anudeep (OID `80fa6a56...`) | litellm-team-d / Rahul | Denied | **PASS** — 403, "JWT sub '80fa6a56...' does not match key owner '8ca1dc25...'" |
+| B7 | B: JWT identity | Fake JWT + Anudeep key | fake | litellm-team-c / Anudeep | Denied | **PASS** — 401, "Invalid identity token" |
+| B8 | B: JWT identity | Old mock JWT (wrong issuer/kid) + Anudeep key | mock | litellm-team-c / Anudeep | Denied | **PASS** — 401, "Unable to find a signing key that matches: mock-key-1" |
+| C1 | C: Management | GET /model/info with master key, no JWT | — | master key | Allowed | **PASS** — 200 OK |
+| C2 | C: Management | GET /key/info with master key, no JWT | — | master key | Allowed | **PASS** — 200 OK |
+| C3 | C: Management | GET /team/list with master key, no JWT | — | master key | Allowed | **PASS** — 200 OK |
+| C4 | C: Management | GET /health/readiness (no auth at all) | — | — | Allowed | **PASS** — 200 OK |
+
 ### Scenario A: Model-Based Team Isolation (6 tests)
 
 Teams with different model permissions — isolation enforced by model restrictions on the virtual key.
 
-| Team | User | Models Allowed | Budget |
-|------|------|---------------|--------|
-| litellm-team-a | Anudeep Nalla | gemini-flash only | $10 |
-| litellm-team-b | Sachin Agarwal | claude-sonnet-4-5 only | $10 |
+| Team | User | Azure AD OID | Models Allowed | Budget |
+|------|------|-------------|---------------|--------|
+| litellm-team-a | Anudeep Nalla | `80fa6a56-cf00-4090-bbce-b6b3021cf1a7` | gemini-flash only | $10 |
+| litellm-team-b | Sachin Agarwal | `91c0c55c-0c8a-49fb-85c9-acef4efb798f` | claude-sonnet-4-5 only | $10 |
 
-| # | Test | Result |
-|---|------|--------|
-| A1 | Anudeep JWT + team-a key → gemini | **Allowed** — "A1 pass" |
-| A2 | Anudeep JWT + team-a key → claude | **Denied** — "key not allowed to access model" |
-| A3 | Sachin JWT + team-b key → claude | **Allowed** — "A3 pass" |
-| A4 | Sachin JWT + team-b key → gemini | **Denied** — "key not allowed to access model" |
-| A5 | Anudeep JWT + Sachin's key (cross-team theft) | **Denied** — "does not match key owner" |
-| A6 | Sachin JWT + Anudeep's key (reverse theft) | **Denied** — "does not match key owner" |
+**What these tests prove:**
+- **A1/A2**: Anudeep's litellm-team-a key allows gemini but blocks claude — LiteLLM model-level access control works.
+- **A3/A4**: Sachin's litellm-team-b key allows claude but blocks gemini — model restrictions are per-key.
+- **A5/A6**: Even if a user steals another user's key, `custom_auth.py` compares the JWT `oid` against the key's `user_id` and rejects the mismatch — cross-team key theft is prevented.
 
 ### Scenario B: Cross-Team Key Isolation via JWT Identity (8 tests)
 
-Teams with identical model permissions — isolation enforced purely by JWT identity binding (`oid == key.user_id`).
+Teams with **identical** model permissions — isolation enforced purely by JWT identity binding (`oid == key.user_id`).
 
-| Team | User | Models Allowed | Budget |
-|------|------|---------------|--------|
-| litellm-team-c | Anudeep Nalla | gemini + claude | $10 |
-| litellm-team-d | Rahul Kaushal | gemini + claude | $10 |
+| Team | User | Azure AD OID | Models Allowed | Budget |
+|------|------|-------------|---------------|--------|
+| litellm-team-c | Anudeep Nalla | `80fa6a56-cf00-4090-bbce-b6b3021cf1a7` | gemini + claude | $10 |
+| litellm-team-d | Rahul Kaushal | `8ca1dc25-e960-4c47-9843-b5b7f51a4315` | gemini + claude | $10 |
 
-| # | Test | JWT user | Key owner | Result |
-|---|------|----------|-----------|--------|
-| B1 | Anudeep JWT + Anudeep key → gemini | Anudeep | Anudeep | **Allowed** — "B1 pass" |
-| B2 | Rahul JWT + Anudeep key | Rahul | Anudeep | **Denied** — "JWT sub '8ca1dc25...' does not match key owner '80fa6a56...'" |
-| B3 | No JWT + virtual key | none | Anudeep | **Denied** — "Missing identity token in X-Identity-Token header" |
-| B4 | Master key, no JWT | admin | master | **Allowed** — admin bypass |
-| B5 | Rahul JWT + Rahul key → claude | Rahul | Rahul | **Allowed** — "B5 pass" |
-| B6 | Anudeep JWT + Rahul key | Anudeep | Rahul | **Denied** — "JWT sub '80fa6a56...' does not match key owner '8ca1dc25...'" |
-| B7 | Fake JWT + key | fake | Anudeep | **Denied** — "Unable to find a signing key" |
-| B8 | Old mock JWT (wrong issuer) | mock | Anudeep | **Denied** — "Unable to find a signing key that matches: mock-key-1" |
+**What these tests prove:**
+- **B1/B5**: Users can use their own keys normally — identity match passes.
+- **B2/B6**: Cross-user key theft is blocked even when both teams have the same model access. The JWT `oid` doesn't match the key's `user_id`, so `custom_auth.py` rejects it with 403.
+- **B3**: Inference routes require a JWT — omitting `X-Identity-Token` returns 401.
+- **B4**: Master key bypasses all checks — admin access is preserved.
+- **B7**: A completely fake JWT fails signature verification against Azure AD's JWKS.
+- **B8**: An old mock JWT (signed with `kid: mock-key-1` by the local RSA key) is rejected because Azure AD's JWKS has no matching signing key.
 
 ### Scenario C: Management & UI Routes (4 tests)
 
 Management routes work with just a session key or master key — no JWT required.
 
-| # | Test | Result |
-|---|------|--------|
-| C1 | GET /model/info with master key, no JWT | **Allowed** — 200 OK |
-| C2 | GET /key/info with master key, no JWT | **Allowed** — 200 OK |
-| C3 | GET /team/list with master key, no JWT | **Allowed** — 200 OK |
-| C4 | GET /health/readiness (no auth) | **Allowed** — 200 OK |
+**What these tests prove:**
+- **C1/C2/C3**: Admin endpoints (`/model/info`, `/key/info`, `/team/list`) work with the master key and no JWT. `custom_auth.py` only enforces JWT on inference routes.
+- **C4**: Health endpoints bypass all auth — kubelet probes work without any token.
 
 ### Running the test suite
 
@@ -658,6 +671,7 @@ Management routes work with just a session key or master key — no JWT required
 export PROXY_MASTER_KEY=$(kubectl get secret -n litellm litellm-env-secret \
   -o jsonpath='{.data.PROXY_MASTER_KEY}' | base64 -d)
 
+# Each user acquires a fresh token (tokens expire after ~1 hour)
 export TOKEN_ANUDEEP=$(az account get-access-token \
   --resource "api://1e959ea2-a6a1-4c58-a413-a0b7e7fa71fe" --query accessToken -o tsv)
 export TOKEN_SACHIN="eyJ..."   # from Sachin
