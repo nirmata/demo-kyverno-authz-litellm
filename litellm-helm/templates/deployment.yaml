@@ -176,11 +176,6 @@ spec:
             - name: litellm-config
               mountPath: /etc/litellm/config.yaml
               subPath: config.yaml
-            {{- if .Values.proxyConfigMap.create }}
-            - name: litellm-config
-              mountPath: /etc/litellm/custom_auth.py
-              subPath: custom_auth.py
-            {{- end }}
           {{ if .Values.securityContext.readOnlyRootFilesystem }}
             - name: tmp
               mountPath: /tmp
@@ -221,10 +216,6 @@ spec:
             items:
               - key: {{ .Values.proxyConfigMap.key | default "config.yaml" }}
                 path: "config.yaml"
-              {{- if .Values.proxyConfigMap.create }}
-              - key: custom_auth.py
-                path: custom_auth.py
-              {{- end }}
       {{- with .Values.volumes }}
         {{- toYaml . | nindent 8 }}
       {{- end }}
