@@ -258,6 +258,7 @@ kubectl apply -f kyverno-validating-policy.yaml
 ```bash
 kubectl create namespace litellm
 
+# Environment secret — API keys and master key
 kubectl create secret generic litellm-env-secret \
   -n litellm \
   --from-literal=PROXY_MASTER_KEY='sk-your-master-key-here' \
@@ -265,13 +266,32 @@ kubectl create secret generic litellm-env-secret \
   --from-literal=GEMINI_API_KEY='your-gemini-key' \
   --from-literal=ANTHROPIC_API_KEY='your-anthropic-key'
 
+# Database credentials — used by LiteLLM to connect to PostgreSQL
+# Must be labeled for Helm adoption (see Issue 22)
 kubectl create secret generic litellm-dbcredentials \
   -n litellm \
   --from-literal=username=litellm \
   --from-literal=password=NoTaGrEaTpAsSwOrD
+kubectl -n litellm label secret litellm-dbcredentials app.kubernetes.io/managed-by=Helm
+kubectl -n litellm annotate secret litellm-dbcredentials \
+  meta.helm.sh/release-name=litellm meta.helm.sh/release-namespace=litellm
+
+# PostgreSQL internal secret — required by the Bitnami PostgreSQL subchart
+# for primary authentication, postgres superuser, and replication (see Issue 22)
+kubectl create secret generic litellm-postgresql \
+  -n litellm \
+  --from-literal=password='NoTaGrEaTpAsSwOrD' \
+  --from-literal=postgres-password='NoTaGrEaTpAsSwOrD' \
+  --from-literal=replication-password='NoTaGrEaTpAsSwOrD'
+kubectl -n litellm label secret litellm-postgresql app.kubernetes.io/managed-by=Helm
+kubectl -n litellm annotate secret litellm-postgresql \
+  meta.helm.sh/release-name=litellm meta.helm.sh/release-namespace=litellm
 ```
 
-> `LITELLM_MASTER_KEY` must be the same value as `PROXY_MASTER_KEY` — the UI login depends on it. See [Issue 17](#issue-17-ui-login-returns-invalid-credentials-litellm_master_key-missing).
+> **Important notes:**
+> - `LITELLM_MASTER_KEY` must be the same value as `PROXY_MASTER_KEY` — the UI login depends on it. See [Issue 17](#issue-17-ui-login-returns-invalid-credentials-litellm_master_key-missing).
+> - Secrets created before `helm install` must have Helm ownership labels/annotations, otherwise Helm will refuse to adopt them with `invalid ownership metadata`. See [Issue 22](#issue-22-helm-cannot-adopt-pre-created-secrets).
+> - The `litellm-postgresql` secret must exist before the PostgreSQL StatefulSet starts; without it, pods will fail with `MountVolume.SetUp failed for volume "postgresql-password"`. See [Issue 23](#issue-23-postgresql-secret-not-auto-created-by-bitnami-subchart).
 
 ### 5. Deploy Mock JWKS Endpoint (local testing only)
 
@@ -281,12 +301,23 @@ kubectl create secret generic litellm-dbcredentials \
 pip install 'PyJWT[crypto]'
 python scripts/generate_test_jwt.py
 
-kubectl create configmap jwks-mock-data \
-  -n litellm \
-  --from-file=jwks.json=scripts/keys/jwks.json
-
+# Deploy the JWKS mock nginx + Service first (the Deployment yaml
+# includes a ConfigMap with placeholder data — this is intentional)
 kubectl apply -f scripts/jwks-deployment.yaml
 
+# Now overwrite the placeholder ConfigMap with the real JWKS keys.
+# IMPORTANT: This must come AFTER kubectl apply, because
+# jwks-deployment.yaml contains a ConfigMap with "PLACEHOLDER" data
+# that would overwrite the real keys if applied second. See Issue 24.
+kubectl create configmap jwks-mock-data \
+  -n litellm \
+  --from-file=jwks.json=scripts/keys/jwks.json \
+  --dry-run=client -o yaml | kubectl apply -f -
+
+# Restart the mock so nginx picks up the real JWKS
+kubectl rollout restart deployment jwks-mock -n litellm
+
+# JWT configuration for custom_auth.py (loaded as env vars)
 kubectl create configmap litellm-jwt-config \
   -n litellm \
   --from-literal=JWT_JWKS_URL=http://jwks-mock.litellm.svc:8080/.well-known/jwks.json \
@@ -294,6 +325,12 @@ kubectl create configmap litellm-jwt-config \
   --from-literal=JWT_AUDIENCE=litellm-proxy \
   --from-literal=JWT_HEADER_NAME=X-Identity-Token
 ```
+
+> **Verify the JWKS endpoint** is serving real keys (not "PLACEHOLDER") before proceeding:
+> ```bash
+> kubectl exec -n litellm deploy/jwks-mock -- cat /usr/share/nginx/html/.well-known/jwks.json
+> ```
+> You should see a JSON object with a `keys` array containing `kid: "mock-key-1"`. If you see `PLACEHOLDER`, the ordering was wrong — re-run the `kubectl create configmap ... --dry-run=client` command above. See [Issue 24](#issue-24-jwks-configmap-placeholder-overwrite).
 
 ### 5b. Configure JWT for Azure AD OIDC (production)
 
@@ -994,6 +1031,158 @@ az login --tenant "3d95acd6-b6ee-428e-a7a0-196120fc3c65" \
 ```
 
 The browser consent prompt appears once. After granting consent, subsequent `az account get-access-token` calls work without user interaction.
+
+---
+
+### Issue 22: Helm Cannot Adopt Pre-Created Secrets
+
+**Symptom:** `helm upgrade --install` fails with:
+
+```
+Error: Unable to continue with install: Secret "litellm-dbcredentials" in namespace "litellm" exists
+and cannot be imported into the current release: invalid ownership metadata;
+label validation error: missing key "app.kubernetes.io/managed-by": must be set to "Helm"
+```
+
+**Root Cause:** Secrets created with `kubectl create secret` before `helm install` don't have Helm ownership labels. Helm refuses to manage resources it didn't create unless they carry the correct metadata.
+
+**Fix:** Label and annotate any pre-created secrets before running Helm:
+
+```bash
+kubectl -n litellm label secret <SECRET_NAME> app.kubernetes.io/managed-by=Helm --overwrite
+kubectl -n litellm annotate secret <SECRET_NAME> \
+  meta.helm.sh/release-name=litellm meta.helm.sh/release-namespace=litellm --overwrite
+```
+
+This applies to `litellm-dbcredentials` and `litellm-postgresql`. The updated Step 4 in the deployment guide already includes these commands.
+
+---
+
+### Issue 23: PostgreSQL Secret Not Auto-Created by Bitnami Subchart
+
+**Symptom:** PostgreSQL StatefulSet pods stuck in `ContainerCreating` with:
+
+```
+MountVolume.SetUp failed for volume "postgresql-password" : secret "litellm-postgresql" not found
+```
+
+**Root Cause:** The Bitnami PostgreSQL subchart expects a secret named `litellm-postgresql` with keys `password`, `postgres-password`, and `replication-password`. On fresh installs (especially with pre-created `litellm-dbcredentials`), the subchart may not auto-generate this secret, or the timing causes a race condition where the StatefulSet starts before the secret is created.
+
+**Fix:** Pre-create the `litellm-postgresql` secret before `helm install`:
+
+```bash
+kubectl create secret generic litellm-postgresql \
+  -n litellm \
+  --from-literal=password='NoTaGrEaTpAsSwOrD' \
+  --from-literal=postgres-password='NoTaGrEaTpAsSwOrD' \
+  --from-literal=replication-password='NoTaGrEaTpAsSwOrD'
+kubectl -n litellm label secret litellm-postgresql app.kubernetes.io/managed-by=Helm
+kubectl -n litellm annotate secret litellm-postgresql \
+  meta.helm.sh/release-name=litellm meta.helm.sh/release-namespace=litellm
+```
+
+The password values must match `postgresql.auth.password`, `postgresql.auth.postgres-password`, and `postgresql.auth.replicationPassword` in `values.yaml`.
+
+---
+
+### Issue 24: JWKS ConfigMap Placeholder Overwrite
+
+**Symptom:** JWT validation fails with `Expecting value: line 1 column 1 (char 0)` (JSON parse error). All inference requests with valid JWTs return 401.
+
+**Root Cause:** `scripts/jwks-deployment.yaml` contains a `ConfigMap` resource with `data.jwks.json: PLACEHOLDER`. If you run `kubectl apply -f scripts/jwks-deployment.yaml` **after** creating the real ConfigMap from `scripts/keys/jwks.json`, the PLACEHOLDER overwrites the real JWKS keys. The mock nginx endpoint then serves "PLACEHOLDER" instead of a valid JSON key set.
+
+**Diagnosis:** Check the JWKS content from inside the cluster:
+
+```bash
+kubectl exec -n litellm deploy/litellm -- \
+  python3 -c "import urllib.request; print(urllib.request.urlopen('http://jwks-mock.litellm.svc:8080/.well-known/jwks.json').read())"
+```
+
+If it prints `b'PLACEHOLDER\n'`, the ConfigMap was overwritten.
+
+**Fix:** Always apply the deployment YAML first, then overwrite the ConfigMap with the real keys, and restart the mock:
+
+```bash
+kubectl apply -f scripts/jwks-deployment.yaml
+
+kubectl create configmap jwks-mock-data \
+  -n litellm \
+  --from-file=jwks.json=scripts/keys/jwks.json \
+  --dry-run=client -o yaml | kubectl apply -f -
+
+kubectl rollout restart deployment jwks-mock -n litellm
+```
+
+**Prevention:** The Step 5 instructions in this guide have been updated to use this ordering. Consider removing the ConfigMap from `jwks-deployment.yaml` entirely and managing it separately.
+
+---
+
+### Issue 25: PyJWKClient Caches Invalid JWKS (Stale Cache After Fix)
+
+**Symptom:** After fixing the JWKS ConfigMap (Issue 24), JWT validation still fails with the same JSON parse error. The JWKS endpoint is confirmed to be serving valid keys, but LiteLLM pods continue to reject JWTs.
+
+**Root Cause:** `custom_auth.py` initializes a global `PyJWKClient` singleton with `cache_keys=True`. Once it fetches the (invalid) JWKS response on the first request, the cached result persists for the lifetime of the process. Fixing the ConfigMap and restarting nginx doesn't help because the LiteLLM process still holds the old cached data.
+
+**Fix:** Restart the LiteLLM deployment after fixing the JWKS endpoint:
+
+```bash
+kubectl rollout restart deployment litellm -n litellm
+```
+
+The new pods will initialize a fresh `PyJWKClient` and fetch the corrected JWKS on their first JWT validation request.
+
+**Note:** `kubectl port-forward` sessions die when pods restart. Re-establish the port-forward after the rollout completes:
+
+```bash
+kubectl port-forward -n litellm svc/litellm 4000:4000
+```
+
+---
+
+## Troubleshooting
+
+### Port-forward dies after pod restarts
+
+`kubectl port-forward` targets a specific pod. When pods restart (due to rollout, crash, or scaling), the port-forward silently breaks. Re-establish it:
+
+```bash
+kubectl port-forward -n litellm svc/litellm 4000:4000
+```
+
+### Anthropic API returns "credit balance is too low"
+
+If Test 5 (claude-sonnet) returns HTTP 400 with `Your credit balance is too low to access the Anthropic API`, the auth layer is working correctly — the request passed all 4 auth checks and reached Anthropic. The issue is with the Anthropic account billing, not the infrastructure. Top up credits at [console.anthropic.com](https://console.anthropic.com).
+
+### Verifying end-to-end connectivity from inside a LiteLLM pod
+
+```bash
+kubectl exec -n litellm deploy/litellm -- python3 -c "
+import urllib.request, json
+
+# 1. JWKS mock
+resp = urllib.request.urlopen('http://jwks-mock.litellm.svc:8080/.well-known/jwks.json')
+data = json.loads(resp.read())
+print('JWKS:', len(data.get('keys',[])), 'keys, kid:', data['keys'][0]['kid'])
+
+# 2. Kyverno authz server (expect 405 on GET — confirms it's reachable)
+try:
+    urllib.request.urlopen('http://kyverno-authz-server.kyverno.svc.cluster.local:9081')
+except Exception as e:
+    print('Kyverno:', e)  # HTTP 405 = reachable, POST-only
+"
+```
+
+Expected output:
+```
+JWKS: 1 keys, kid: mock-key-1
+Kyverno: HTTP Error 405: Method Not Allowed
+```
+
+### Checking LiteLLM custom_auth logs
+
+```bash
+kubectl logs -n litellm deploy/litellm --tail=50 | grep -i "auth\|jwt\|kyverno"
+```
 
 ---
 
