@@ -8,43 +8,79 @@ spec:
     mode: HTTP
 
   variables:
+  # JWKS — fetch signing keys from the mock (or Azure AD) endpoint
+  - name: jwks_url
+    expression: string("http://jwks-mock.litellm.svc:8080/.well-known/jwks.json")
+  - name: certs
+    expression: jwks.Fetch(variables.jwks_url)
+
+  # Request metadata (HTTP mode with nestedRequest: true)
   - name: auth_header
     expression: object.attributes.header[?"Authorization"].orValue([""])[0]
   - name: has_token
     expression: variables.auth_header.startsWith("Bearer ") && variables.auth_header.size() > 10
   - name: path
     expression: object.attributes.path
-  - name: method
-    expression: object.attributes.method
-  - name: jwt_sub
-    expression: object.attributes.header[?"X-Jwt-Sub"].orValue([""])[0]
-  - name: jwt_groups
-    expression: object.attributes.header[?"X-Jwt-Groups"].orValue([""])[0]
-  - name: jwt_email
-    expression: object.attributes.header[?"X-Jwt-Email"].orValue([""])[0]
+  - name: identity_token
+    expression: object.attributes.header[?"X-Identity-Token"].orValue([""])[0]
+
+  # Route classification
+  - name: is_inference
+    expression: >
+      variables.path.startsWith("/v1/chat/completions") ||
+      variables.path.startsWith("/chat/completions") ||
+      variables.path.startsWith("/v1/completions") ||
+      variables.path.startsWith("/completions") ||
+      variables.path.startsWith("/v1/embeddings") ||
+      variables.path.startsWith("/embeddings") ||
+      variables.path.startsWith("/v1/images") ||
+      variables.path.startsWith("/v1/audio") ||
+      variables.path.startsWith("/v1/moderations")
+
+  # JWT decode — only when X-Identity-Token is present and looks like a JWT
+  - name: jwt_decoded
+    expression: >
+      variables.identity_token != "" && variables.identity_token.split(".").size() == 3
+        ? jwt.Decode(variables.identity_token, variables.certs)
+        : null
+  - name: jwt_valid
+    expression: >
+      variables.jwt_decoded != null && variables.jwt_decoded.Valid
 
   validations:
-  # 1. Allow health check routes without auth
+  # 1. Health routes — no auth needed (kubelet probes)
   - expression: |
       variables.path.startsWith("/health") || variables.path == "/ready" || variables.path == "/healthz"
         ? http.Allowed().Response()
         : null
 
-  # 2. Deny requests without a Bearer token
+  # 2. No Bearer token at all — deny
   - expression: |
       !variables.has_token
         ? http.Denied("Missing or invalid Bearer token").Response()
         : null
 
-  # 3. All authenticated requests are allowed through Kyverno.
-  #    Fine-grained checks (model access, budget, team/user scoping, JWT
-  #    identity binding) are enforced by custom_auth.py and LiteLLM's
-  #    internal auth pipeline.
+  # 3. Inference routes: require X-Identity-Token header
+  - expression: |
+      variables.is_inference && variables.identity_token == ""
+        ? http.Denied("Missing identity token for inference route").Response()
+        : null
+
+  # 4. Inference routes: JWT must be valid (signature, expiry verified by jwks.Fetch + jwt.Decode)
+  - expression: |
+      variables.is_inference && variables.identity_token != "" && !variables.jwt_valid
+        ? http.Denied("Invalid identity token").Response()
+        : null
+
+  # 5. All authenticated requests pass through Kyverno.
+  #    Fine-grained checks (model access, budget, key ownership) are
+  #    enforced by custom_auth.py and LiteLLM's internal auth pipeline.
+  #    JWT claims are available via jwt_decoded.Claims for future rules.
   - expression: |
       variables.has_token
         ? http.Allowed().Response()
         : null
 
-  # 4. Default deny (unreachable — kept as safety net)
+  # 6. Default deny (safety net)
   - expression: |
       http.Denied("Route not allowed by policy").Response()
