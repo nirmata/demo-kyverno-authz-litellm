@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# End-to-end demo & test script for Azure AD OIDC + LiteLLM + Kyverno
+# End-to-end demo & test script for Azure AD OIDC + LiteLLM + AI Governance Proxy
 #
 # Tests two scenarios with real Azure AD tokens from 3 users:
 #
@@ -497,7 +497,7 @@ echo ""
 
 echo "  Authorization Layers Verified:"
 echo "    1. Azure AD OIDC — JWT signature, issuer, audience, expiry"
-echo "    2. Kyverno Authz Server — Bearer token presence gate"
+echo "    2. AI Governance Proxy — POST /authz/litellm (CEL policies)"
 echo "    3. custom_auth.py — JWT identity binding (oid == key.user_id)"
 echo "    4. LiteLLM Internal Auth — model access, budget, team scoping"
 echo ""

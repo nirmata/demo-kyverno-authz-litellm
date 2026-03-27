@@ -1,6 +1,6 @@
-# AI Auth — LiteLLM + Kyverno + Azure AD OIDC
+# AI Auth — LiteLLM + AI Governance Proxy + Azure AD OIDC
 
-A production-grade AI gateway that unifies multiple LLM providers behind a single OpenAI-compatible API, with four-layer authorization: Azure AD OIDC identity verification, Kyverno policy evaluation, custom JWT-to-key ownership binding, and LiteLLM virtual key management with spend tracking.
+A production-grade AI gateway that unifies multiple LLM providers behind a single OpenAI-compatible API, with four-layer authorization: Azure AD OIDC identity verification, **AI Governance Proxy** policy on `POST /authz/litellm` (CEL policies from `governance-helm/values-authz.yml`), custom JWT-to-key ownership binding in `custom_auth.py`, and LiteLLM virtual key management with spend tracking. This demo does **not** deploy cluster Kyverno or `kyverno-authz-server`.
 
 ---
 
@@ -23,8 +23,8 @@ A production-grade AI gateway that unifies multiple LLM providers behind a singl
 │  │  1. Health probe? ──────────────────────────────► bypass (master key)  │  │
 │  │  2. Master key?   ──────────────────────────────► bypass (no JWT)     │  │
 │  │  3. Inference route?                                                   │  │
-│  │     YES → Validate Azure JWT → Kyverno (+ claims) → key ownership    │  │
-│  │     NO  → Kyverno (route check only) → LiteLLM DB auth              │  │
+│  │     YES → Validate Azure JWT → POST /authz/litellm → key ownership  │  │
+│  │     NO  → governance allow (or skip) → LiteLLM DB auth              │  │
 │  │  4. Return api_key string for DB lookup                               │  │
 │  └────────────────────────────────────────────────────────────────────────┘  │
 │                                                                              │
@@ -44,9 +44,9 @@ A production-grade AI gateway that unifies multiple LLM providers behind a singl
                  ┌─────────────────────┼──────────────────────┐
                  ▼                     ▼                      ▼
      ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐
-     │  Azure AD (JWKS)  │  │ Kyverno Authz    │  │ Azure AD (Entra) │
-     │  login.microsoft  │  │ Server :9081     │  │ Users & Groups   │
-     │  online.com/keys  │  │ nestedRequest    │  │                  │
+     │  Azure AD (JWKS)  │  │ AI Governance    │  │ Azure AD (Entra) │
+     │  login.microsoft  │  │ Proxy :8081      │  │ Users & Groups   │
+     │  online.com/keys  │  │ /authz/litellm   │  │                  │
      └──────────────────┘  └──────────────────┘  └──────────────────┘
 ```
 
@@ -55,19 +55,19 @@ A production-grade AI gateway that unifies multiple LLM providers behind a singl
 | Layer | Component | Responsibility |
 |-------|-----------|----------------|
 | 1. Identity | Azure AD OIDC (PyJWT + JWKS) | Verify caller identity on inference routes via signed JWT. Validate signature, expiry, issuer (`login.microsoftonline.com`), audience (app registration). Extract `oid` as stable user identifier. |
-| 2. Policy | Kyverno Authz Server | Coarse-grained authentication gate: reject unauthenticated requests. JWT claims forwarded as `X-Jwt-Sub`, `X-Jwt-Groups`, `X-Jwt-Email` for future claim-based rules. |
+| 2. Policy | AI Governance Proxy (`POST /authz/litellm`) | CEL policies in `governance-helm/values-authz.yml` (Kyverno-flavored CEL in-process). Audit and allow/deny before LiteLLM continues. |
 | 3. Ownership | custom_auth.py key binding | On inference routes, compare JWT `oid` claim against virtual key's `user_id`. Prevents cross-user key theft even when teams share model permissions. |
 | 4. Access Control | LiteLLM Internal Auth | Token validity (DB lookup), model access, budget enforcement, team/user scoping, spend tracking. |
 
 ### Route Classification in custom_auth.py
 
-| Route type | Examples | JWT required? | Key ownership check? | Kyverno check? |
+| Route type | Examples | JWT required? | Key ownership check? | Governance `/authz/litellm`? |
 |------------|----------|---------------|---------------------|----------------|
 | Health | `/health/readiness`, `/healthz` | No (bypass) | No | No |
 | Master key | Any route with master key | No (bypass) | No | No |
-| Inference | `/v1/chat/completions`, `/v1/embeddings` | **Yes** | **Yes** | Yes (with JWT claims) |
-| Management | `/key/*`, `/team/*`, `/user/*`, `/model/*` | No | No | Yes (token presence) |
-| UI / SSO | `/ui/*`, `/sso/*`, `/login`, `/global/*`, `/config/*` | No | No | Yes (token presence) |
+| Inference | `/v1/chat/completions`, `/v1/embeddings` | **Yes** | **Yes** | Yes (policy + audit) |
+| Management | `/key/*`, `/team/*`, `/user/*`, `/model/*` | No | No | Yes (per `custom_auth.py` + values) |
+| UI / SSO | `/ui/*`, `/sso/*`, `/login`, `/global/*`, `/config/*` | No | No | Yes (per `custom_auth.py` + values) |
 
 ---
 
@@ -80,7 +80,7 @@ A production-grade AI gateway that unifies multiple LLM providers behind a singl
 | PostgreSQL Read Replicas | 2 | `litellm` | Read scaling |
 | Redis Master | 1 | `litellm` | Cache + transaction buffer |
 | Redis Replicas | 2 | `litellm` | Read scaling |
-| Kyverno Authz Server | 1 | `kyverno` | Policy-based authorization |
+| AI Governance Proxy | 1 | `governance` | `POST /authz/litellm`, CEL policies, audit |
 
 ---
 
@@ -93,8 +93,9 @@ AI-auth/
 ├── AZURE_OIDC_INTEGRATION_PLAN.md     # Azure AD OIDC migration plan
 ├── AUTHZ_LAYER_ARCHITECTURE.md        # Authorization layer design
 ├── Dockerfile                         # Multi-arch image: LiteLLM + PyJWT + custom_auth.py
-├── custom_auth.py                     # JWT validation + Kyverno bridge + key ownership check
-├── kyverno-validating-policy.yaml     # CEL-based authorization rules
+├── custom_auth.py                     # JWT validation + governance proxy `/authz/litellm` + key ownership
+├── governance-helm/                   # Helm chart for AI Governance Proxy
+│   └── values-authz.yml               # Azure OIDC + CEL policies + image tag
 ├── litellm-helm/
 │   ├── values.yaml                    # Helm chart configuration
 │   └── ...                            # LiteLLM Helm chart templates
@@ -135,19 +136,13 @@ AI-auth/
    │           oid=80fa6a56-cf00-4090-bbce-b6b3021cf1a7
    │           email=anudeep.nalla@nirmata.com
    │           groups=[1de73371-..., ...]  (Azure AD group GUIDs)
-   ├── Build raw HTTP/1.1 bytes with injected claims:
-   │     Authorization: Bearer sk-C4AV...
-   │     X-Jwt-Sub: 80fa6a56-cf00-4090-bbce-b6b3021cf1a7
-   │     X-Jwt-Email: anudeep.nalla@nirmata.com
-   │     X-Jwt-Groups: 1de73371-...,4454a15a-...
-   └── POST raw bytes → Kyverno Authz Server :9081
+   └── POST JSON → AI Governance Proxy `http://<governance>:8081/authz/litellm`
+         (model, path, method, identity token; see `custom_auth.py`)
 
-3. Kyverno Authz Server:
-   ├── Parses raw bytes via Go's httputil.ReadRequest
-   ├── Evaluates ValidatingPolicy (CEL):
-   │     ├── Has Bearer token? YES → Allowed
-   │     └── (JWT claims available as headers for future rules)
-   └── Returns 200
+3. AI Governance Proxy:
+   ├── Validates identity token for policy (CEL) per `values-authz.yml`
+   ├── Returns `{ result: { allow, message } }` (and audit events when configured)
+   └── Deny stops the request before LiteLLM provider routing
 
 4. custom_auth.py — key ownership check:
    ├── GET /key/info?key=sk-C4AV... (internal loopback with master key)
@@ -176,10 +171,9 @@ AI-auth/
 2. custom_auth.py:
    ├── Not a health route, not master key
    ├── Path does NOT match INFERENCE_PREFIXES → skip JWT
-   ├── Build raw HTTP/1.1 bytes (no JWT claims injected)
-   └── POST raw bytes → Kyverno Authz Server :9081
+   └── Call governance `/authz/litellm` per current logic (non-inference paths)
 
-3. Kyverno: Has Bearer token? YES → Allowed (200)
+3. Governance proxy returns allow/deny per CEL policies in `values-authz.yml`
 
 4. custom_auth.py: skip key ownership check (not inference)
 
@@ -192,68 +186,40 @@ AI-auth/
 
 - Kubernetes cluster (tested on KIND and Docker Desktop)
 - Helm 3
-- Docker Buildx (for multi-arch image builds)
+- Docker Buildx (for multi-arch image builds: LiteLLM custom image and optionally `ai-governance-proxy`)
 - Azure CLI (`az`) for Azure AD setup and token acquisition
-- cert-manager installed in the cluster
-- Kyverno ValidatingPolicy CRD installed
 - `curl` and `jq` for testing
 
 ---
 
 ## Deployment
 
-### 1. Install cert-manager and CRDs
+### 1. Build and push AI Governance Proxy (optional if using a prebuilt image)
+
+From the **`ai-governance-proxy`** repository root:
 
 ```bash
-helm install cert-manager \
-  --namespace cert-manager --create-namespace \
-  --wait \
-  --repo https://charts.jetstack.io cert-manager \
-  --set crds.enabled=true
-
-kubectl apply -f - <<EOF
-apiVersion: cert-manager.io/v1
-kind: ClusterIssuer
-metadata:
-  name: selfsigned-issuer
-spec:
-  selfSigned: {}
-EOF
-
-kubectl apply \
-  -f https://raw.githubusercontent.com/kyverno/kyverno/refs/heads/main/config/crds/policies.kyverno.io/policies.kyverno.io_validatingpolicies.yaml
+docker buildx build \
+  --platform linux/amd64,linux/arm64 \
+  -t <your-registry>/ai-governance-proxy:<tag> \
+  --push .
 ```
 
-### 2. Deploy Kyverno Authz Server
+Set `proxy.image.repository` and `proxy.image.tag` in `governance-helm/values-authz.yml` to match.
+
+### 2. Deploy AI Governance Proxy (Helm)
 
 ```bash
-helm upgrade --install kyverno-authz-server \
-  --namespace kyverno --create-namespace \
-  --wait \
-  --repo https://kyverno.github.io/kyverno-authz kyverno-authz-server \
-  --values - <<'EOF'
-config:
-  type: http
-  http:
-    address: ":9081"
-    nestedRequest: true
-validatingWebhookConfiguration:
-  certificates:
-    certManager:
-      issuerRef:
-        group: cert-manager.io
-        kind: ClusterIssuer
-        name: selfsigned-issuer
-EOF
+helm upgrade --install ai-governance \
+  ./governance-helm \
+  -f ./governance-helm/values-authz.yml \
+  -n governance \
+  --create-namespace
 ```
 
-### 3. Apply Kyverno Authorization Policy
+Service DNS: `http://ai-governance-proxy.governance.svc.cluster.local:8081` — base URL for `AI_GOVERNANCE_PROXY_URL` if you override defaults in `litellm-helm/values.yaml`.
 
-```bash
-kubectl apply -f kyverno-validating-policy.yaml
-```
-
-### 4. Create Kubernetes Secrets
+### 3. Create Kubernetes Secrets
 
 ```bash
 kubectl create namespace litellm
@@ -271,11 +237,11 @@ kubectl create secret generic litellm-dbcredentials \
   --from-literal=password=NoTaGrEaTpAsSwOrD
 ```
 
-> `LITELLM_MASTER_KEY` must be the same value as `PROXY_MASTER_KEY` — the UI login depends on it. See [Issue 17](#issue-17-ui-login-returns-invalid-credentials-litellm_master_key-missing).
+> `LITELLM_MASTER_KEY` must be the same value as `PROXY_MASTER_KEY` — the UI login depends on it. See [Issue 13](#issue-13-ui-login-returns-invalid-credentials-litellm_master_key-missing).
 
-### 5. Deploy Mock JWKS Endpoint (local testing only)
+### 4. Deploy Mock JWKS Endpoint (local testing only)
 
-> Skip this step if using Azure AD OIDC in production. Go to [Step 5b](#5b-configure-jwt-for-azure-ad-oidc-production) instead.
+> Skip this step if using Azure AD OIDC in production. Go to [Step 4b](#4b-configure-jwt-for-azure-ad-oidc-production) instead.
 
 ```bash
 pip install 'PyJWT[crypto]'
@@ -295,7 +261,7 @@ kubectl create configmap litellm-jwt-config \
   --from-literal=JWT_HEADER_NAME=X-Identity-Token
 ```
 
-### 5b. Configure JWT for Azure AD OIDC (production)
+### 4b. Configure JWT for Azure AD OIDC (production)
 
 ```bash
 TENANT_ID="3d95acd6-b6ee-428e-a7a0-196120fc3c65"
@@ -317,7 +283,7 @@ kubectl create configmap litellm-jwt-config \
 | `JWT_AUDIENCE` | `litellm-proxy` | Azure App Registration client ID (GUID) |
 | `JWT_HEADER_NAME` | `X-Identity-Token` | `X-Identity-Token` |
 
-### 6. Build and Push Custom Image
+### 5. Build and Push Custom LiteLLM Image
 
 ```bash
 docker buildx build \
@@ -342,7 +308,7 @@ image:
   tag: "v10"
 ```
 
-### 7. Deploy LiteLLM
+### 6. Deploy LiteLLM
 
 ```bash
 kubectl delete job litellm-migrations -n litellm --ignore-not-found
@@ -351,11 +317,11 @@ helm upgrade --install litellm ./litellm-helm \
   -n litellm
 ```
 
-### 8. Verify
+### 7. Verify
 
 ```bash
 kubectl get pods -n litellm
-kubectl get pods -n kyverno
+kubectl get pods -n governance
 kubectl port-forward -n litellm svc/litellm 4000:4000
 ```
 
@@ -496,8 +462,8 @@ az ad group member add --group "litellm-team-d" --member-id "8ca1dc25-e960-4c47-
 |-------------|---------------|---------------------------|
 | `oid` | `80fa6a56-cf00-4090-bbce-b6b3021cf1a7` | `jwt_sub` — key ownership check (`oid == key.user_id`) |
 | `sub` | `074UOXmkq51-sbWz17hOqNGO-...` | **Not used** — pairwise, different per app |
-| `email` | `anudeep.nalla@nirmata.com` | Forwarded to Kyverno as `X-Jwt-Email` |
-| `groups` | `["1de73371-...", "4454a15a-..."]` | Forwarded to Kyverno as `X-Jwt-Groups` (comma-separated GUIDs) |
+| `email` | `anudeep.nalla@nirmata.com` | Available in governance CEL / audit context |
+| `groups` | `["1de73371-...", "4454a15a-..."]` | Azure AD group object IDs for policy / audit |
 | `iss` | `https://login.microsoftonline.com/{tenant}/v2.0` | Validated by PyJWT |
 | `aud` | `1e959ea2-a6a1-4c58-a413-a0b7e7fa71fe` | Validated by PyJWT |
 | `exp` | Unix timestamp | Validated by PyJWT (rejects expired tokens) |
@@ -795,7 +761,7 @@ Access at `http://127.0.0.1:4000/ui` — login with username `admin` and the mas
 
 **Root Cause:** Envoy `data-plane-api` repo restructured; transitive proto dependencies unresolvable.
 
-**Fix:** Abandoned gRPC entirely. Switched to Kyverno HTTP mode with `nestedRequest: true`.
+**Fix:** Abandoned gRPC Envoy authz. The current design uses the **AI Governance Proxy** with `POST /authz/litellm` (HTTP JSON) instead of gRPC.
 
 ---
 
@@ -807,57 +773,13 @@ Access at `http://127.0.0.1:4000/ui` — login with username `admin` and the mas
 
 ---
 
-### Issue 9: Kyverno Policy — Wrong API Version
+### Issue 9: Superseded — cluster Kyverno authz prototype
 
-**Symptom:** `policies.kyverno.io/v1alpha1 ValidatingPolicy is deprecated`
-
-**Fix:** Updated `apiVersion` from `v1alpha1` to `v1`.
+Older iterations used `kyverno-authz-server`, raw HTTP `nestedRequest`, and cluster `ValidatingPolicy` CEL (API version, header paths, CRLF encoding). **This demo does not use that path.** Policy is enforced in the **AI Governance Proxy** via `governance-helm/values-authz.yml` and `POST /authz/litellm`.
 
 ---
 
-### Issue 10: Kyverno Policy — Wrong Header Object Path (Envoy vs HTTP Mode)
-
-**Symptom:** `undefined field 'request'` in CEL expression `object.attributes.request.http.headers`
-
-**Root Cause:** Envoy mode uses `object.attributes.request.http.headers`. HTTP mode with `nestedRequest: true` uses a flat structure: `object.attributes.header`, `.path`, `.method`.
-
-**Fix:** Changed all CEL expressions to use the HTTP mode object structure.
-
----
-
-### Issue 11: Kyverno Policy — Header Value Type Mismatch
-
-**Symptom:** `found no matching overload for 'orValue' applied to 'optional_type(list(string)).(string)'`
-
-**Root Cause:** With `nestedRequest: true`, Go's `http.Header` is `map[string][]string`. The optional wraps `list(string)`, not `string`. Using `.orValue("")` (string default) fails against a list type.
-
-**Fix:** `object.attributes.header[?"Authorization"].orValue([""])[0]` — default to an empty list, take the first element.
-
----
-
-### Issue 12: Kyverno Policy — Header Key Casing
-
-**Symptom:** Kyverno always returns "Missing or invalid Bearer token" despite the request containing `Authorization: Bearer sk-...`.
-
-**Root Cause:** Go's `httputil.ReadRequest` canonicalizes header keys to title-case (`Authorization`). The policy looked for lowercase `authorization`.
-
-**Diagnosis:** Deployed a debug policy outputting both cases: `lower_auth=none`, `title_auth=Bearer sk-test...`.
-
-**Fix:** Changed `header[?"authorization"]` to `header[?"Authorization"]`.
-
----
-
-### Issue 13: Raw HTTP Bytes — Escaped vs Real CRLF
-
-**Symptom:** Kyverno could not parse headers from the raw HTTP bytes.
-
-**Root Cause:** Used `\\r\\n` (escaped) in Python f-strings, producing literal backslash characters instead of real CRLF bytes (0x0D 0x0A).
-
-**Fix:** Used `"\r\n".join(lines)` with real carriage-return/line-feed, encoded as `latin-1`.
-
----
-
-### Issue 14: PostgreSQL Replication Password Missing
+### Issue 10: PostgreSQL Replication Password Missing
 
 **Symptom:** `PASSWORDS ERROR: The secret "litellm-postgresql" does not contain the key "replication-password"`
 
@@ -865,33 +787,21 @@ Access at `http://127.0.0.1:4000/ui` — login with username `admin` and the mas
 
 ---
 
-### Issue 15: LiteLLM Strips Authorization Header Before Custom Auth
+### Issue 11: LiteLLM `Authorization` header vs `api_key` parameter
 
-**Symptom:** After adding JWT validation (v8), Kyverno received `Authorization: Bearer` without the actual token value (`auth_len=6`). JWT claims (`X-Jwt-Sub`) forwarded correctly.
+**Symptom (historical):** Policy layers that re-read `Authorization` from `request.headers` sometimes saw only `Bearer` without the token — LiteLLM passes the virtual key as the `api_key` argument to `custom_auth`, not via the raw header.
 
-**Root Cause:** LiteLLM's middleware extracts the Bearer token from the `Authorization` header and passes it as the `api_key` parameter to `custom_auth.py`. The `request.headers["authorization"]` value is left as just `"Bearer"` (stripped of the actual token).
-
-**Diagnosis:** Deployed a debug Kyverno policy that returned header values in the denial message: `auth_len=6` confirmed the token was stripped.
-
-**Fix:** In `_build_raw_http_request`, skip the original `authorization` header from `request.headers` and explicitly inject a fresh one from the `api_key` parameter:
-
-```python
-lines.append(f"Authorization: Bearer {api_key}")
-for key, value in request.headers.items():
-    if key.lower() == "authorization":
-        continue
-    lines.append(f"{key}: {value}")
-```
+**Fix:** `custom_auth.py` sends the virtual key to the governance proxy in the JSON body (`token` / `model` / `path` / …) using the `api_key` value from LiteLLM, not by reparsing a stripped header.
 
 ---
 
-### Issue 16: JWT Required on All Routes Broke the Admin UI (v8 → v9)
+### Issue 12: JWT Required on All Routes Broke the Admin UI (v8 → v9)
 
 **Symptom:** After logging into the UI (`/ui/?login=success`), every page showed `{"error":{"message":"Missing identity token in X-Identity-Token header"}}`. The UI was completely non-functional despite login succeeding.
 
 **Root Cause:** In v8, `custom_auth.py` required a JWT (`X-Identity-Token` header) on **every** non-health, non-master-key request. After a UI login, LiteLLM generates an internal session key (not the master key) and uses it for all subsequent API calls. The UI does not send a JWT.
 
-**Fix (v9):** Introduced an `INFERENCE_PREFIXES` tuple in `custom_auth.py` that lists inference routes. JWT validation and key ownership checks are enforced **only** on inference routes. Management and UI routes pass through to Kyverno (token presence check) and LiteLLM's internal DB auth without requiring a JWT:
+**Fix (v9):** Introduced an `INFERENCE_PREFIXES` tuple in `custom_auth.py` that lists inference routes. JWT validation and key ownership checks are enforced **only** on inference routes. Management and UI routes call the governance proxy without an identity JWT (per policy) and rely on LiteLLM DB auth for session keys:
 
 ```python
 INFERENCE_PREFIXES = (
@@ -907,13 +817,13 @@ if is_inference:
     # validate JWT, extract claims, check key ownership
     ...
 else:
-    # skip JWT — Kyverno checks token presence, LiteLLM checks DB validity
+    # skip JWT — governance route policy + LiteLLM DB validity
     ...
 ```
 
 ---
 
-### Issue 17: UI Login Returns "Invalid Credentials" (LITELLM_MASTER_KEY Missing)
+### Issue 13: UI Login Returns "Invalid Credentials" (LITELLM_MASTER_KEY Missing)
 
 **Symptom:** POST to `/login` with `username=admin` and `password=<master-key>` returned `Invalid credentials used to access UI`.
 
@@ -931,29 +841,15 @@ kubectl patch secret litellm-env-secret -n litellm \
 
 ---
 
-### Issue 18: Kyverno Policy Default-Deny Blocked 50+ UI Internal Routes
+### Issue 14: Governance CEL policies and UI routes
 
-**Symptom:** UI login succeeded but most tabs showed 403 errors on routes like `/global/spend/teams`, `/config/list`, `/v2/model/info`, and 50+ others.
+**Symptom:** UI tabs returned 403 if CEL rules in `values-authz.yml` were too strict for management routes (e.g. requiring `identity_token` everywhere).
 
-**Root Cause:** The Kyverno policy had an explicit route allow-list that didn't cover the many internal API routes the UI calls.
-
-**Fix:** Simplified the Kyverno policy from a route-level allow-list to an **authentication gate**:
-
-```yaml
-# Old approach (5 route-matching rules + default deny)
-# → broke on every new UI route
-
-# New approach (3 rules):
-# 1. Allow health routes without auth
-# 2. Deny requests without a Bearer token
-# 3. Allow all authenticated requests
-```
-
-The rationale: Kyverno's role is **coarse-grained** — it only needs to reject unauthenticated requests. Fine-grained authorization (model access, budget, team scoping, JWT identity) is handled by `custom_auth.py` and LiteLLM's internal auth pipeline. The JWT claim variables (`jwt_sub`, `jwt_groups`, `jwt_email`) remain in the policy for future claim-based rules.
+**Fix:** Tune `litellmPolicies` / `litellmPolicy` so health and management/UI paths behave as intended — often inference routes require identity while session-key-backed UI calls do not. Validate with `helm upgrade` and proxy logs.
 
 ---
 
-### Issue 19: Azure AD `sub` Claim is Pairwise (v9 → v10)
+### Issue 15: Azure AD `sub` Claim is Pairwise (v9 → v10)
 
 **Symptom:** Key ownership check failed because Azure's `sub` claim (`074UOXmkq51-sbWz17hOqNGO-...`) didn't match the `user_id` stored in LiteLLM (which was the Azure `oid` GUID).
 
@@ -963,7 +859,7 @@ The rationale: Kyverno's role is **coarse-grained** — it only needs to reject 
 
 ---
 
-### Issue 20: Azure CLI Service Principal Not Registered in Tenant
+### Issue 16: Azure CLI Service Principal Not Registered in Tenant
 
 **Symptom:** `az account get-access-token --resource "api://..."` returned `AADSTS650057: Invalid resource`.
 
@@ -979,7 +875,7 @@ az rest --method PATCH --uri "https://graph.microsoft.com/v1.0/applications/${AP
 
 ---
 
-### Issue 21: Azure AD Consent Not Granted (AADSTS65001)
+### Issue 17: Azure AD Consent Not Granted (AADSTS65001)
 
 **Symptom:** `az account get-access-token --resource "api://..."` returned `AADSTS65001: The user or administrator has not consented to use the application`.
 
@@ -1010,4 +906,4 @@ The browser consent prompt appears once. After granting consent, subsequent `az 
 | v7 | Fixed CRLF encoding in raw HTTP bytes |
 | v8 | Phase 1: JWT identity binding (PyJWT + JWKS + key ownership check + Authorization header reconstruction) |
 | v9 | Scoped JWT to inference routes only; UI/management routes pass through without JWT (fixes Issues 16-18) |
-| v10 | Azure AD OIDC: use `oid` claim instead of `sub` for stable identity binding (fixes Issue 19) |
+| v10 | Azure AD OIDC: use `oid` claim instead of `sub` for stable identity binding (fixes Issue 15) |

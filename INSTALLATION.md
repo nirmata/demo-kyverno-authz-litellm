@@ -1,6 +1,6 @@
-# Installation Guide — AI Auth (LiteLLM + Kyverno + Azure AD OIDC)
+# Installation Guide — AI Auth (LiteLLM + AI Governance Proxy + Azure AD OIDC)
 
-End-to-end guide to deploy the AI Auth gateway on Kubernetes with Azure AD OIDC identity binding. Every command is explained so you understand what it does and why it's needed.
+End-to-end guide to deploy the AI Auth gateway on Kubernetes with Azure AD OIDC identity binding. Policy for LiteLLM traffic is enforced by the **AI Governance Proxy** (`POST /authz/litellm`), deployed from the in-repo **`governance-helm`** chart using **`governance-helm/values-authz.yml`**. Every command is explained so you understand what it does and why it's needed.
 
 ---
 
@@ -8,23 +8,21 @@ End-to-end guide to deploy the AI Auth gateway on Kubernetes with Azure AD OIDC 
 
 1. [Prerequisites](#1-prerequisites)
 2. [Cluster Setup (KIND)](#2-cluster-setup-kind)
-3. [Install cert-manager](#3-install-cert-manager)
-4. [Install Kyverno Authz Server](#4-install-kyverno-authz-server)
-5. [Apply Kyverno Authorization Policy](#5-apply-kyverno-authorization-policy)
-6. [Create Kubernetes Namespace and Secrets](#6-create-kubernetes-namespace-and-secrets)
-7. [Build and Push Custom LiteLLM Image](#7-build-and-push-custom-litellm-image)
-8. [Deploy LiteLLM via Helm](#8-deploy-litellm-via-helm)
-9. [Verify the Deployment](#9-verify-the-deployment)
-10. [Azure AD App Registration](#10-azure-ad-app-registration)
-11. [Create Azure AD Groups](#11-create-azure-ad-groups)
-12. [Add Users to Azure AD Groups](#12-add-users-to-azure-ad-groups)
-13. [Configure Azure AD Token Claims](#13-configure-azure-ad-token-claims)
-14. [Create OAuth2 Scope and Pre-authorize Azure CLI](#14-create-oauth2-scope-and-pre-authorize-azure-cli)
-15. [Update Kubernetes ConfigMap for Azure AD](#15-update-kubernetes-configmap-for-azure-ad)
-16. [Create LiteLLM Teams and Virtual Keys](#16-create-litellm-teams-and-virtual-keys)
-17. [Acquire Azure AD Tokens](#17-acquire-azure-ad-tokens)
-18. [Run the End-to-End Test Suite](#18-run-the-end-to-end-test-suite)
-19. [Cleanup](#19-cleanup)
+3. [AI Governance Proxy — build image and Helm deploy](#3-ai-governance-proxy--build-image-and-helm-deploy)
+4. [Create Kubernetes Namespace and Secrets](#4-create-kubernetes-namespace-and-secrets)
+5. [Build and Push Custom LiteLLM Image](#5-build-and-push-custom-litellm-image)
+6. [Deploy LiteLLM via Helm](#6-deploy-litellm-via-helm)
+7. [Verify the Deployment](#7-verify-the-deployment)
+8. [Azure AD App Registration](#8-azure-ad-app-registration)
+9. [Create Azure AD Groups](#9-create-azure-ad-groups)
+10. [Add Users to Azure AD Groups](#10-add-users-to-azure-ad-groups)
+11. [Configure Azure AD Token Claims](#11-configure-azure-ad-token-claims)
+12. [Create OAuth2 Scope and Pre-authorize Azure CLI](#12-create-oauth2-scope-and-pre-authorize-azure-cli)
+13. [Update Kubernetes ConfigMap for Azure AD](#13-update-kubernetes-configmap-for-azure-ad)
+14. [Create LiteLLM Teams and Virtual Keys](#14-create-litellm-teams-and-virtual-keys)
+15. [Acquire Azure AD Tokens](#15-acquire-azure-ad-tokens)
+16. [Run the End-to-End Test Suite](#16-run-the-end-to-end-test-suite)
+17. [Cleanup](#17-cleanup)
 
 ---
 
@@ -33,7 +31,7 @@ End-to-end guide to deploy the AI Auth gateway on Kubernetes with Azure AD OIDC 
 | Tool | Minimum Version | Purpose |
 |------|-----------------|---------|
 | `kubectl` | 1.27+ | Kubernetes cluster management |
-| `helm` | 3.x | Deploying charts (cert-manager, Kyverno, LiteLLM) |
+| `helm` | 3.x | Deploying charts (governance-helm, LiteLLM) |
 | `docker` | 24+ with Buildx | Building multi-arch custom LiteLLM image |
 | `az` (Azure CLI) | 2.50+ | Azure AD app registration, group management, token acquisition |
 | `curl` | any | Testing API endpoints |
@@ -73,105 +71,53 @@ kubectl cluster-info --context kind-ai-auth
 
 ---
 
-## 3. Install cert-manager
+## 3. AI Governance Proxy — build image and Helm deploy
 
-cert-manager automates TLS certificate management in Kubernetes. Kyverno's webhook server needs a TLS certificate to communicate with the Kubernetes API server.
+The **AI Governance Proxy** is a Go service (repo: `ai-governance-proxy`) that exposes `POST /authz/litellm` on the admin port. LiteLLM's `custom_auth.py` sends JSON (token, model, path, identity token); the proxy validates Azure OIDC (per `values-authz.yml`) and evaluates **CEL policies** (Kyverno-flavored CEL) in-process. This demo does **not** install the cluster Kyverno admission stack or `kyverno-authz-server`.
 
-```bash
-helm install cert-manager \
-  --namespace cert-manager \
-  --create-namespace \
-  --wait \
-  --repo https://charts.jetstack.io cert-manager \
-  --set crds.enabled=true
-```
+### 3.1 Build and push the image (from `ai-governance-proxy`)
 
-| Flag | Explanation |
-|------|-------------|
-| `--namespace cert-manager` | Installs into a dedicated namespace |
-| `--create-namespace` | Creates the namespace if it doesn't exist |
-| `--wait` | Blocks until all pods are ready before returning |
-| `--repo` | Pulls the chart directly from Jetstack's Helm repository |
-| `--set crds.enabled=true` | Installs the Custom Resource Definitions (CRDs) that cert-manager needs |
-
-Create a `ClusterIssuer` — this tells cert-manager how to issue certificates. We use self-signed certs since this is for internal Kyverno webhook communication:
+From the **`ai-governance-proxy`** repository root (the directory that contains `go.mod` and `Dockerfile`):
 
 ```bash
-kubectl apply -f - <<EOF
-apiVersion: cert-manager.io/v1
-kind: ClusterIssuer
-metadata:
-  name: selfsigned-issuer
-spec:
-  selfSigned: {}
-EOF
+cd /path/to/ai-governance-proxy
+
+docker buildx build \
+  --platform linux/amd64,linux/arm64 \
+  -t <your-registry>/ai-governance-proxy:<your-tag> \
+  --push .
 ```
 
-Install the Kyverno ValidatingPolicy CRD — this custom resource definition is required for Kyverno to understand our authorization policy:
+The Dockerfile builds `./cmd/proxy` and runs a distroless image; exposed ports **8080** (MCP), **8081** (admin + `/authz/litellm`), **9081** / **9082** (gRPC/HTTP authz). Match **`<your-registry>/ai-governance-proxy:<your-tag>`** to `proxy.image.repository` and `proxy.image.tag` in `governance-helm/values-authz.yml` (or override with `helm --set`).
+
+### 3.2 Deploy with Helm
+
+From this demo folder (where `governance-helm/` is vendored):
 
 ```bash
-kubectl apply \
-  -f https://raw.githubusercontent.com/kyverno/kyverno/refs/heads/main/config/crds/policies.kyverno.io/policies.kyverno.io_validatingpolicies.yaml
+helm upgrade --install ai-governance \
+  ./governance-helm \
+  -f ./governance-helm/values-authz.yml \
+  -n governance \
+  --create-namespace
 ```
+
+This creates the `governance` namespace and a Service **`ai-governance-proxy`** (ClusterIP). `custom_auth.py` must reach the governance proxy at **`http://ai-governance-proxy.governance.svc.cluster.local:8081`** (or set **`AI_GOVERNANCE_PROXY_URL`** to that base URL; `litellm-helm/values.yaml` may set `extraEnvVars` accordingly).
+
+### 3.3 What `values-authz.yml` configures
+
+| Area | Purpose |
+|------|---------|
+| `proxy.mode: authz-provider` | LiteLLM authz backend mode |
+| `proxy.image` | Container image for the proxy (build and push per §3.1) |
+| `identity.oidcProviders` | Azure AD issuer, JWKS, audience (align with LiteLLM `litellm-jwt-config`) |
+| `litellmPolicies` / `litellmPolicy` | CEL rules for `/authz/litellm` (e.g. require identity, audit) |
+
+After changing the image tag or identity settings, run `helm upgrade` again and optionally `kubectl rollout restart deploy/ai-governance-proxy -n governance`.
 
 ---
 
-## 4. Install Kyverno Authz Server
-
-Kyverno Authz Server is a standalone server that evaluates authorization policies against HTTP requests. It acts as a policy decision point.
-
-```bash
-helm upgrade --install kyverno-authz-server \
-  --namespace kyverno \
-  --create-namespace \
-  --wait \
-  --repo https://kyverno.github.io/kyverno-authz kyverno-authz-server \
-  --values - <<'EOF'
-config:
-  type: http
-  http:
-    address: ":9081"
-    nestedRequest: true
-validatingWebhookConfiguration:
-  certificates:
-    certManager:
-      issuerRef:
-        group: cert-manager.io
-        kind: ClusterIssuer
-        name: selfsigned-issuer
-EOF
-```
-
-| Setting | Explanation |
-|---------|-------------|
-| `config.type: http` | Uses HTTP mode (not gRPC/Envoy). Our `custom_auth.py` sends raw HTTP request bytes to Kyverno for policy evaluation. |
-| `config.http.address: ":9081"` | The port Kyverno listens on for authorization requests |
-| `config.http.nestedRequest: true` | Tells Kyverno to parse the request body as a nested HTTP request (Go's `httputil.ReadRequest`). This is how `custom_auth.py` forwards the original client request to Kyverno for inspection. |
-| `certificates.certManager` | Uses the `selfsigned-issuer` from cert-manager for the webhook's TLS certificate |
-
----
-
-## 5. Apply Kyverno Authorization Policy
-
-This policy defines the authorization rules that Kyverno evaluates:
-
-```bash
-kubectl apply -f kyverno-validating-policy.yaml
-```
-
-The policy (`kyverno-validating-policy.yaml`) implements three rules using CEL expressions:
-
-1. **Allow health routes** — `/health/*`, `/ready`, `/healthz` pass without any auth (kubelet probes).
-2. **Deny unauthenticated** — Requests without a valid `Authorization: Bearer <token>` header are rejected with 403.
-3. **Allow authenticated** — All requests with a Bearer token are allowed through Kyverno.
-
-Fine-grained authorization (model access, budget, team scoping, JWT identity binding) is handled by `custom_auth.py` and LiteLLM's internal auth — not by Kyverno. Kyverno's role is a coarse-grained authentication gate.
-
-The policy also extracts JWT claim headers (`X-Jwt-Sub`, `X-Jwt-Groups`, `X-Jwt-Email`) as variables for future claim-based rules (e.g., allow only certain groups to access specific models at the Kyverno level).
-
----
-
-## 6. Create Kubernetes Namespace and Secrets
+## 4. Create Kubernetes Namespace and Secrets
 
 ### Create the namespace
 
@@ -232,11 +178,11 @@ kubectl create configmap litellm-jwt-config \
 | `JWT_AUDIENCE` | Expected `aud` claim in the JWT. PyJWT rejects tokens meant for a different audience. |
 | `JWT_HEADER_NAME` | The HTTP header where clients send their identity JWT. Default is `X-Identity-Token` (separate from the `Authorization` header which carries the LiteLLM virtual key). |
 
-> This ConfigMap will be **replaced** with Azure AD values in [Step 15](#15-update-kubernetes-configmap-for-azure-ad).
+> This ConfigMap will be **replaced** with Azure AD values in [Step 13](#13-update-kubernetes-configmap-for-azure-ad).
 
 ---
 
-## 7. Build and Push Custom LiteLLM Image
+## 5. Build and Push Custom LiteLLM Image
 
 The custom image adds PyJWT (for JWT validation) and `custom_auth.py` (the auth handler) on top of the official LiteLLM database image.
 
@@ -278,7 +224,7 @@ docker buildx build \
 
 ---
 
-## 8. Deploy LiteLLM via Helm
+## 6. Deploy LiteLLM via Helm
 
 LiteLLM is deployed using a Helm chart that includes the proxy, PostgreSQL (1 primary + 2 read replicas), and Redis (1 master + 2 replicas).
 
@@ -313,13 +259,13 @@ Key settings in `values.yaml`:
 
 ---
 
-## 9. Verify the Deployment
+## 7. Verify the Deployment
 
 ### Check pod status
 
 ```bash
 kubectl get pods -n litellm
-kubectl get pods -n kyverno
+kubectl get pods -n governance
 ```
 
 Expected output — all pods should be `Running` with `READY 1/1`:
@@ -376,7 +322,7 @@ This confirms that LiteLLM pods can reach Microsoft's JWKS endpoint (needed for 
 
 ---
 
-## 10. Azure AD App Registration
+## 8. Azure AD App Registration
 
 An App Registration in Azure AD (Entra ID) creates an identity for your application. Azure AD will issue JWTs scoped to this application.
 
@@ -446,7 +392,7 @@ The `requestedAccessTokenVersion: 2` ensures all access tokens are v2.0 format, 
 
 ---
 
-## 11. Create Azure AD Groups
+## 9. Create Azure AD Groups
 
 Azure AD security groups map to LiteLLM teams. When a user authenticates, their group memberships appear in the JWT `groups` claim as GUIDs.
 
@@ -486,7 +432,7 @@ Teams C and D have **identical** model permissions — isolation comes purely fr
 
 ---
 
-## 12. Add Users to Azure AD Groups
+## 10. Add Users to Azure AD Groups
 
 Look up each user's Azure AD Object ID (OID) — this is the stable GUID that identifies the user across all apps:
 
@@ -532,7 +478,7 @@ az ad group member list --group "$GROUP_C" --query '[].{name:displayName, oid:id
 
 ---
 
-## 13. Configure Azure AD Token Claims
+## 11. Configure Azure AD Token Claims
 
 By default, Azure AD access tokens don't include `groups`, `email`, or `preferred_username` claims. We need to configure the app registration to emit these.
 
@@ -556,14 +502,14 @@ az rest --method PATCH \
 | `optionalClaims.accessToken[].email` | Adds the user's email address to the access token. By default, Azure only includes it in ID tokens, not access tokens. |
 | `optionalClaims.accessToken[].preferred_username` | Adds the UPN (User Principal Name) to the access token. Useful for logging and display. |
 
-These claims are used by `custom_auth.py`:
-- `groups` → forwarded to Kyverno as `X-Jwt-Groups` for future claim-based policies
-- `email` → forwarded to Kyverno as `X-Jwt-Email` for audit logging
+These claims are used by `custom_auth.py` and are available to the governance proxy in policy context (CEL) when evaluating `/authz/litellm`:
+- `groups` — Azure AD group object IDs
+- `email` / `preferred_username` — user identity for audit
 - `oid` → used as the identity for key ownership checks (always present in v2.0 tokens, no extra config needed)
 
 ---
 
-## 14. Create OAuth2 Scope and Pre-authorize Azure CLI
+## 12. Create OAuth2 Scope and Pre-authorize Azure CLI
 
 ### Add an OAuth2 permission scope
 
@@ -623,7 +569,7 @@ The `delegatedPermissionIds` array contains the `id` of the OAuth2 scope created
 
 ---
 
-## 15. Update Kubernetes ConfigMap for Azure AD
+## 13. Update Kubernetes ConfigMap for Azure AD
 
 Now replace the mock JWT configuration with Azure AD endpoints:
 
@@ -659,7 +605,7 @@ This performs a rolling restart — pods are replaced one at a time with zero do
 
 ---
 
-## 16. Create LiteLLM Teams and Virtual Keys
+## 14. Create LiteLLM Teams and Virtual Keys
 
 With the proxy running and Azure AD configured, create LiteLLM teams and virtual keys that map to Azure AD users.
 
@@ -769,7 +715,7 @@ export KEY_RAHUL_D="sk-..."     # Rahul, team-d, gemini + claude
 
 ---
 
-## 17. Acquire Azure AD Tokens
+## 15. Acquire Azure AD Tokens
 
 Each user must authenticate with Azure AD to get a JWT. The JWT proves their identity and carries their group memberships.
 
@@ -835,7 +781,7 @@ Key observations:
 - `oid` is the stable Azure Object ID — used by `custom_auth.py` for key ownership checks
 - `sub` is pairwise (different per app) — **not** used for identity
 - `groups` contains Azure AD security group GUIDs
-- `scp: "access_as_user"` confirms the OAuth2 scope from Step 14
+- `scp: "access_as_user"` confirms the OAuth2 scope from Step 12
 - `exp` is the Unix timestamp when the token expires (typically 1 hour)
 
 ### Repeat for each user
@@ -855,7 +801,7 @@ az account get-access-token \
 
 ---
 
-## 18. Run the End-to-End Test Suite
+## 16. Run the End-to-End Test Suite
 
 The test script (`scripts/test_azure_oidc.sh`) validates all three authorization scenarios using real Azure AD tokens.
 
@@ -870,7 +816,7 @@ export TOKEN_ANUDEEP="eyJ0eXAi..."
 export TOKEN_SACHIN="eyJ0eXAi..."
 export TOKEN_RAHUL="eyJ0eXAi..."
 
-# LiteLLM virtual keys (from Step 16)
+# LiteLLM virtual keys (from Step 14)
 export KEY_ANUDEEP_A="sk-..."   # team-a, gemini only
 export KEY_SACHIN_B="sk-..."    # team-b, claude only
 export KEY_ANUDEEP_C="sk-..."   # team-c, gemini + claude
@@ -909,7 +855,7 @@ CREATE_KEYS=true bash scripts/test_azure_oidc.sh
 
   Authorization Layers Verified:
     1. Azure AD OIDC — JWT signature, issuer, audience, expiry
-    2. Kyverno Authz Server — Bearer token presence gate
+    2. AI Governance Proxy — CEL policy on POST /authz/litellm (values-authz.yml)
     3. custom_auth.py — JWT identity binding (oid == key.user_id)
     4. LiteLLM Internal Auth — model access, budget, team scoping
 
@@ -953,7 +899,7 @@ CREATE_KEYS=true bash scripts/test_azure_oidc.sh
 
 ---
 
-## 19. Cleanup
+## 17. Cleanup
 
 ### Remove mock JWKS resources (no longer needed with Azure AD)
 
@@ -1028,4 +974,4 @@ The UI does not require a JWT — it uses session keys internally.
 | `JWT_ISSUER` | ConfigMap | Expected token issuer |
 | `JWT_AUDIENCE` | ConfigMap | Expected token audience (app client ID) |
 | `JWT_HEADER_NAME` | ConfigMap | Header carrying the identity JWT |
-| `KYVERNO_AUTHZ_URL` | Defaults in code | Kyverno server URL for policy checks |
+| `AI_GOVERNANCE_PROXY_URL` | LiteLLM pod env (optional) | Base URL for governance proxy (default in code: `http://ai-governance-proxy.governance.svc.cluster.local:8081`) |

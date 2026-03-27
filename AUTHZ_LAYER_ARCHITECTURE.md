@@ -2,7 +2,7 @@
 
 ## Scope
 
-This design centralizes identity, authorization, token governance, and budget controls for AI access across LiteLLM and other gateways.
+This design centralizes identity, authorization, token governance, and budget controls for AI access across LiteLLM and other gateways. The **AI Governance Proxy** (`ai-governance-proxy`) is the policy decision point for LiteLLM: it exposes `POST /authz/litellm`, validates the user JWT (Azure AD OIDC), evaluates **Kyverno CEL policies** in-process (not the cluster Kyverno admission stack), and returns allow/deny/audit to `custom_auth.py`.
 
 ---
 
@@ -11,11 +11,11 @@ This design centralizes identity, authorization, token governance, and budget co
 Use Azure AD (Entra ID) directly as the identity provider for users and groups.
 
 1. User authenticates with Azure OIDC and gets a JWT.
-2. Client calls gateway/proxy (LiteLLM) with identity token.
-3. LiteLLM `custom_auth` forwards token + request context to AuthZ server.
-4. AuthZ server validates token and evaluates policy (user/team/org/model/route/quota).
-5. On allow, `custom_auth` returns scoped `UserAPIKeyAuth`.
-6. LiteLLM executes request and logs spend tied to user/team/org.
+2. Client calls LiteLLM with `Authorization: Bearer <virtual key>` and `X-Identity-Token: <Azure JWT>`.
+3. LiteLLM `custom_auth.py` validates the JWT (JWKS, `iss`, `aud`, `exp`) and POSTs context to the **AI Governance Proxy** at `/authz/litellm` (JSON: token, model, path, method, identity token).
+4. The governance proxy validates the identity token again for policy (CEL), evaluates policies (e.g. require user identity, model restrictions, audit), and returns `{ result: { allow, message } }`.
+5. `custom_auth.py` enforces **virtual key ownership** (`oid` == key `user_id`) and returns the key string for LiteLLM DB lookup.
+6. LiteLLM executes the request and logs spend tied to user/team/org.
 
 ---
 
@@ -63,9 +63,9 @@ Azure may omit full `groups` in token for users with many groups.
 
 When overage indicator is present:
 
-1. AuthZ server calls Microsoft Graph using app credentials.
-2. Fetches transitive group memberships for `oid`.
-3. Applies team/org mapping and authorization policy.
+1. The governance proxy or a sidecar can call Microsoft Graph using app credentials.
+2. Fetch transitive group memberships for `oid`.
+3. Apply team/org mapping and authorization policy (today many deployments rely on `groups` in the token only).
 
 Do not skip this check, or high-group users may bypass team binding.
 
@@ -73,21 +73,22 @@ Do not skip this check, or high-group users may bypass team binding.
 
 ## LiteLLM Integration Pattern
 
-- Keep LiteLLM virtual keys as optional operational credentials.
-- Treat Azure JWT as primary identity.
-- `custom_auth.py` becomes the adapter that:
-  - validates/forwards JWT to AuthZ server
-  - receives allow/deny + scoped obligations
-  - returns `UserAPIKeyAuth` with `user_id`, `team_id`, `org_id`, allowed models/routes, rpm/tpm, budget limits.
+- Keep LiteLLM virtual keys as operational credentials; bind them to Azure `oid` in the key record.
+- Treat Azure JWT as primary identity on inference routes.
+- `custom_auth.py` is the adapter that:
+  - validates JWT (PyJWT + JWKS)
+  - calls the governance proxy `/authz/litellm` for policy (fail-closed on HTTP errors is configurable; see code)
+  - enforces key ownership (`oid` == `user_id`)
+  - returns the API key string for LiteLLM’s internal auth (models, budget, teams).
 
 ---
 
 ## Done Criteria for Phase 1
 
-- A user cannot use another user's key.
-- Team/org boundaries are enforced from Azure claims + mapping.
-- Every request is traceable to Azure identity in audit logs.
-- AuthZ decisions are externalized in central policy service.
+- A user cannot use another user's virtual key (JWT `oid` binding).
+- Team/org boundaries are enforced via LiteLLM teams/keys plus Azure claims where policies apply.
+- Inference requests are traceable to Azure identity in the governance Web UI audit stream (`/api/v1/audit/events`).
+- Policy decisions for LLM traffic are centralized in the **AI Governance Proxy** (CEL policies loaded from Helm values, e.g. `governance-helm/values-authz.yml`).
 
 ---
 

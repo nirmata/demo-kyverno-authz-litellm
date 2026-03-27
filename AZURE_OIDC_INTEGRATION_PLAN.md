@@ -15,7 +15,7 @@ Replace the mock JWT issuer (local RSA keys + nginx JWKS endpoint) with Azure AD
 ## Current State (Mock JWT — What We Have)
 
 ```
-Client                    custom_auth.py                    Kyverno
+Client                    custom_auth.py              AI Governance Proxy
   │                            │                               │
   │ X-Identity-Token: <JWT>    │                               │
   │ (signed by local RSA key)  │                               │
@@ -27,9 +27,9 @@ Client                    custom_auth.py                    Kyverno
   │────────────────────────────>                               │
   │                            │ Validate JWT via JWKS          │
   │                            │ (jwks-mock nginx pod)          │
+  │                            │ POST /authz/litellm (JSON)     │
   │                            │────────────────────────────────>
-  │                            │ X-Jwt-Sub: user-c              │
-  │                            │ X-Jwt-Groups: team-c           │
+  │                            │ allow + audit (CEL policies)   │
   │                            │<────────────────────────────────
   │                            │                               │
   │                            │ key ownership: sub == user_id? │
@@ -56,14 +56,14 @@ Client                    custom_auth.py                    Kyverno
 - JWT validation (signature, expiry, issuer, audience)
 - Key ownership binding on inference routes
 - Management/UI routes work without JWT
-- Kyverno forwards JWT claims (`X-Jwt-Sub`, `X-Jwt-Groups`, `X-Jwt-Email`)
+- AI Governance Proxy evaluates `/authz/litellm` (CEL; configured in `governance-helm/values-authz.yml`)
 
 ---
 
 ## Target State (Azure AD OIDC)
 
 ```
-Client                    custom_auth.py                     Kyverno
+Client                    custom_auth.py              AI Governance Proxy
   │                            │                                │
   │ X-Identity-Token: <JWT>    │                                │
   │ (signed by Microsoft)      │                                │
@@ -76,9 +76,9 @@ Client                    custom_auth.py                     Kyverno
   │────────────────────────────>                                │
   │                            │ Validate JWT via JWKS           │
   │                            │ (login.microsoftonline.com)     │
+  │                            │ POST /authz/litellm             │
   │                            │─────────────────────────────────>
-  │                            │ X-Jwt-Sub: AaBb11Cc-...         │
-  │                            │ X-Jwt-Groups: guid-1,guid-2     │
+  │                            │ allow/deny + audit (CEL)        │
   │                            │<─────────────────────────────────
   │                            │                                │
   │                            │ key ownership: oid == user_id?  │
@@ -337,11 +337,14 @@ result = app.acquire_token_interactive(scopes=["api://litellm-proxy/.default"])
 token = result["access_token"]
 ```
 
-### Step 7: Kyverno Policy Changes
+### Step 7: AI Governance Proxy policy (`values-authz.yml`)
 
-**No changes needed.** The current Kyverno policy only checks for Bearer token presence. JWT claims are forwarded as `X-Jwt-Sub`, `X-Jwt-Groups`, `X-Jwt-Email` headers — the values change (GUIDs instead of friendly names) but the forwarding mechanism is unchanged.
+When switching from mock JWT to Azure AD, keep **`governance-helm/values-authz.yml`** aligned with the same tenant and audience as LiteLLM’s `litellm-jwt-config`:
 
-Future enhancement: Add CEL rules that check `X-Jwt-Groups` contains a specific Azure group GUID for route-level restrictions.
+- **`identity.oidcProviders`** — `issuer`, JWKS URL, and `audience` must match `JWT_ISSUER` / `JWT_JWKS_URL` / `JWT_AUDIENCE`.
+- **`litellmPolicies` / `litellmPolicy`** — CEL rules run in the proxy (e.g. require authenticated user, audit). Tighten or add rules for Azure group GUIDs if you need route- or model-level gates at the governance layer.
+
+After edits: `helm upgrade` the governance release and `kubectl rollout restart deploy/ai-governance-proxy -n governance` if needed.
 
 ### Step 8: Docker Image Changes
 
@@ -410,14 +413,14 @@ If NOT implementing the `oid` fallback (i.e., Azure v2.0 `sub` is acceptable as 
 
 | Component | Changes? | Details |
 |-----------|----------|---------|
-| `custom_auth.py` | **1-line change** | `oid` claim fallback: `claims.get("oid", claims.get("sub"))` |
-| `kyverno-validating-policy.yaml` | **No change** | Still checks Bearer token presence, forwards JWT claims |
-| `Dockerfile` | **No change** | Same base image, same PyJWT install |
-| `litellm-helm/values.yaml` | **Tag bump** (v9 → v10) | Only if custom_auth.py changes |
+| `custom_auth.py` | **1-line change** (if not already) | `oid` claim fallback: `claims.get("oid", claims.get("sub"))` |
+| `governance-helm/values-authz.yml` | **Update** | Azure `issuer` / audience / CEL policies; redeploy governance Helm release |
+| `ai-governance-proxy` image | **Optional rebuild** | If you change proxy code; tag must match `proxy.image` in values |
+| `Dockerfile` (LiteLLM) | **No change** | Same base image, same PyJWT install |
+| `litellm-helm/values.yaml` | **Tag bump** | Only if custom_auth.py changes |
 | `litellm-jwt-config` ConfigMap | **3 values change** | JWKS URL, issuer, audience → Azure endpoints |
 | LiteLLM teams | **Recreate** | Use Azure group names/IDs |
 | Virtual keys | **Recreate** | `user_id` must be Azure `oid` (GUID) |
-| Kyverno Authz Server | **No change** | Same HTTP nestedRequest mode |
 | `test_jwt_identity.sh` | **Update** | Load Azure tokens instead of mock JWTs |
 
 ---
