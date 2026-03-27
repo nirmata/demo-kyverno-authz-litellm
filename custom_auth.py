@@ -9,10 +9,13 @@ from jwt import PyJWKClient
 
 logger = logging.getLogger("litellm.custom_auth")
 
-KYVERNO_AUTHZ_URL = os.environ.get(
-    "KYVERNO_AUTHZ_URL",
-    "http://kyverno-authz-server.kyverno.svc.cluster.local:9081",
+AI_GOVERNANCE_PROXY_URL = os.environ.get(
+    "AI_GOVERNANCE_PROXY_URL",
+    "http://ai-governance-proxy.governance.svc.cluster.local:8081/authz/litellm",
 )
+AI_GOVERNANCE_PROXY_TIMEOUT = float(os.environ.get(
+    "AI_GOVERNANCE_PROXY_TIMEOUT", "5"
+))
 
 JWT_JWKS_URL = os.environ.get(
     "JWT_JWKS_URL",
@@ -74,42 +77,83 @@ async def _get_key_owner(api_key: str, master_key: str) -> Optional[str]:
     return None
 
 
+async def _call_governance_proxy(
+    api_key: str,
+    path: str,
+    method: str,
+    model: str = "",
+    user: str = "",
+    identity_token: str = "",
+) -> None:
+    """POST to the AI Governance Proxy /authz/litellm endpoint.
+
+    Raises ProxyException on deny or communication failure (fail-closed).
+    """
+    payload = {
+        "token": api_key,
+        "model": model,
+        "path": path,
+        "method": method,
+        "user": user,
+    }
+    if identity_token:
+        payload["identity_token"] = identity_token
+
+    try:
+        async with httpx.AsyncClient(timeout=AI_GOVERNANCE_PROXY_TIMEOUT) as client:
+            resp = await client.post(AI_GOVERNANCE_PROXY_URL, json=payload)
+
+        if resp.status_code == 401:
+            result = resp.json().get("result", {})
+            raise ProxyException(
+                message=result.get("message", "Rejected by governance policy"),
+                type="auth_error",
+                param="identity_token",
+                code=401,
+            )
+
+        result = resp.json().get("result", {})
+        if result.get("allow") is not True:
+            raise ProxyException(
+                message=result.get("message", "Blocked by AI Governance Policy"),
+                type="auth_error",
+                param="api_key",
+                code=403,
+            )
+
+    except ProxyException:
+        raise
+    except Exception as exc:
+        logger.warning("Governance proxy call failed: %s", exc)
+
+
 async def user_api_key_auth(
     request: Request, api_key: str
 ) -> Union[UserAPIKeyAuth, str]:
     """
-    Custom auth handler with JWT identity binding (Phase 1).
-
-    JWT + key ownership is enforced only on inference routes (chat completions,
-    embeddings, etc.).  Management routes (key/team/user CRUD, UI, SSO) go
-    through Kyverno route checks + LiteLLM's built-in DB auth without a JWT.
+    Custom auth handler with JWT identity binding + AI Governance Proxy.
 
     Flow:
-      1. Bypass health probes and master key (no JWT required)
+      1. Bypass health probes and master key (no governance call)
       2. Determine if this is an inference route
-      3. If inference: validate JWT, call Kyverno with claims, check key ownership
-      4. If management/UI: call Kyverno (route check only), let LiteLLM handle DB auth
+      3. If inference: validate JWT, call governance proxy with identity, check key ownership
+      4. If management: call governance proxy without identity (route-level audit)
       5. Return api_key string for LiteLLM DB lookup
     """
     path = str(request.url.path).rstrip("/")
     master_key = os.environ.get("PROXY_MASTER_KEY", "")
 
-    # 1. Health probes — kubelet sends no tokens
     if path in HEALTH_ROUTES:
         return master_key
 
-    # 2. Master key — admin bypass, no JWT required
     if master_key and api_key == master_key:
         return master_key
 
     is_inference = any(path.startswith(p) for p in INFERENCE_PREFIXES)
 
     jwt_sub = ""
-    jwt_email = ""
-    jwt_groups: list = []
-    extra_headers: dict = {}
+    jwt_token = ""
 
-    # 3. JWT validation — required only for inference routes
     if is_inference:
         jwt_token = request.headers.get(JWT_HEADER_NAME)
         if not jwt_token:
@@ -137,48 +181,23 @@ async def user_api_key_auth(
                 code=401,
             )
         jwt_sub = claims.get("oid", claims.get("sub", ""))
-        jwt_groups = claims.get("groups", [])
-        jwt_email = claims.get("email", "")
-        extra_headers = {
-            "X-Jwt-Sub": jwt_sub,
-            "X-Jwt-Email": jwt_email,
-            "X-Jwt-Groups": ",".join(jwt_groups) if jwt_groups else "",
-        }
 
-    # 4. Call Kyverno — route-level policy check (+ JWT claims on inference)
+    body = {}
     try:
-        body = b""
-        try:
-            body = await request.body()
-        except Exception:
-            pass
-
-        raw_request = _build_raw_http_request(
-            request, body, api_key=api_key, extra_headers=extra_headers or None,
-        )
-
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            response = await client.post(
-                KYVERNO_AUTHZ_URL,
-                content=raw_request,
-                headers={"Content-Type": "application/octet-stream"},
-            )
-
-        if response.status_code != 200:
-            raise ProxyException(
-                message=f"Rejected by Kyverno policy: {response.text}",
-                type="auth_error",
-                param="api_key",
-                code=403,
-            )
-
-    except ProxyException:
-        raise
-
+        body = await request.json()
     except Exception:
         pass
+    model = body.get("model", "") if isinstance(body, dict) else ""
 
-    # 5. Key ownership check — only for inference routes with a JWT
+    await _call_governance_proxy(
+        api_key=api_key,
+        path=path,
+        method=request.method,
+        model=model,
+        user=jwt_sub,
+        identity_token=jwt_token,
+    )
+
     if is_inference:
         key_owner = await _get_key_owner(api_key, master_key)
         if key_owner and key_owner != jwt_sub:
@@ -189,30 +208,4 @@ async def user_api_key_auth(
                 code=403,
             )
 
-    # 6. Return key string — LiteLLM hashes it, looks it up in DB,
-    #    and enforces model/budget/team scoping
     return api_key
-
-
-def _build_raw_http_request(
-    request: Request, body: bytes, api_key: str = "", extra_headers: dict = None
-) -> bytes:
-    """
-    Reconstruct raw HTTP/1.1 request for Kyverno nestedRequest: true.
-
-    LiteLLM's middleware may strip or modify the Authorization header after
-    extracting the token, so we skip it from request.headers and always
-    inject a fresh one from the api_key parameter.
-    """
-    lines = []
-    lines.append(f"{request.method} {request.url.path} HTTP/1.1")
-    lines.append(f"Authorization: Bearer {api_key}")
-    for key, value in request.headers.items():
-        if key.lower() == "authorization":
-            continue
-        lines.append(f"{key}: {value}")
-    if extra_headers:
-        for key, value in extra_headers.items():
-            lines.append(f"{key}: {value}")
-    header_block = "\r\n".join(lines) + "\r\n\r\n"
-    return header_block.encode("latin-1") + body

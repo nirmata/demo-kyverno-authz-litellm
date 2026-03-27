@@ -1,0 +1,131 @@
+{{- if .Values.postgres.enabled }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: postgres
+    {{- include "governance.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      containers:
+        - name: postgres
+          image: {{ .Values.postgres.database.image }}
+          env:
+            - name: POSTGRES_DB
+              value: {{ .Values.postgres.database.name | quote }}
+            - name: POSTGRES_USER
+              value: {{ .Values.postgres.database.user | quote }}
+            - name: POSTGRES_PASSWORD
+              value: {{ .Values.postgres.database.password | quote }}
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          ports:
+            - containerPort: {{ .Values.postgres.database.port }}
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", {{ .Values.postgres.database.user | quote }}, "-d", {{ .Values.postgres.database.name | quote }}]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            {{- toYaml .Values.postgres.database.resources | nindent 12 }}
+          {{- if .Values.postgres.database.persistence.enabled }}
+          volumeMounts:
+            - name: pgdata
+              mountPath: /var/lib/postgresql/data
+          {{- end }}
+      {{- if .Values.postgres.database.persistence.enabled }}
+      volumes:
+        - name: pgdata
+          persistentVolumeClaim:
+            claimName: postgres-data
+      {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: postgres
+spec:
+  selector:
+    app: postgres
+  ports:
+    - port: {{ .Values.postgres.database.port }}
+      targetPort: {{ .Values.postgres.database.port }}
+{{- if .Values.postgres.database.persistence.enabled }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-data
+  namespace: {{ .Release.Namespace }}
+spec:
+  accessModes: [ReadWriteOnce]
+  {{- if .Values.postgres.database.persistence.storageClass }}
+  storageClassName: {{ .Values.postgres.database.persistence.storageClass | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.postgres.database.persistence.size }}
+{{- end }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres-mcp
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: postgres-mcp
+    {{- include "governance.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres-mcp
+  template:
+    metadata:
+      labels:
+        app: postgres-mcp
+    spec:
+      containers:
+        - name: postgres-mcp
+          image: {{ .Values.postgres.mcp.image }}
+          args:
+            - "--transport"
+            - "sse"
+            - "--sse-port"
+            - {{ .Values.postgres.mcp.port | quote }}
+          env:
+            - name: DATABASE_URI
+              value: "postgresql://{{ .Values.postgres.database.user }}:{{ .Values.postgres.database.password }}@postgres:{{ .Values.postgres.database.port }}/{{ .Values.postgres.database.name }}"
+          ports:
+            - containerPort: {{ .Values.postgres.mcp.port }}
+          resources:
+            {{- toYaml .Values.postgres.mcp.resources | nindent 12 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-mcp
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: postgres-mcp
+spec:
+  selector:
+    app: postgres-mcp
+  ports:
+    - port: {{ .Values.postgres.mcp.port }}
+      targetPort: {{ .Values.postgres.mcp.port }}
+{{- end }}

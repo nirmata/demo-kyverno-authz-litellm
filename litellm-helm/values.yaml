@@ -13,7 +13,7 @@ image:
   # Overrides the image tag whose default is the chart appVersion.
   # tag: "main-latest"
   #tag: "main-stable"
-  tag: "v10"
+  tag: "v11"
 imagePullSecrets: []
 nameOverride: "litellm"
 fullnameOverride: ""
@@ -304,7 +304,10 @@ envVars: {}
 
 # USE_DDTRACE: "true"
 # Additional environment variables to be added to the deployment as a list of k8s env vars
-extraEnvVars: {}
+#extraEnvVars: {}
+extraEnvVars:
+  - name: AI_GOVERNANCE_PROXY_URL
+    value: "http://ai-governance-proxy.governance.svc.cluster.local:8081/authz/litellm"
 
 # if you want to override the container command, you can do so here
 command: {}

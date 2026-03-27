@@ -1,0 +1,5 @@
+# Keep packaged chart small — release Secret max 1MB in Kubernetes
+architecture.png
+*.png
+ISSUES.md
+test-governance.sh

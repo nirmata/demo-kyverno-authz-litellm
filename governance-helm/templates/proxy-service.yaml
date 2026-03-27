@@ -1,0 +1,29 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: ai-governance-proxy
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "governance.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.proxy.service.type }}
+  selector:
+    app: ai-governance-proxy
+    {{- include "governance.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: mcp
+      port: {{ .Values.proxy.service.mcpPort }}
+      targetPort: mcp
+      protocol: TCP
+    - name: admin
+      port: {{ .Values.proxy.service.adminPort }}
+      targetPort: admin
+      protocol: TCP
+    - name: authz-grpc
+      port: {{ .Values.proxy.service.authzGrpcPort }}
+      targetPort: authz-grpc
+      protocol: TCP
+    - name: authz-http
+      port: {{ .Values.proxy.service.authzHttpPort }}
+      targetPort: authz-http
+      protocol: TCP

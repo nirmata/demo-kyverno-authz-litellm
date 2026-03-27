@@ -1,0 +1,18 @@
+apiVersion: v2
+name: governance-litellm-helm
+description: AI Governance Proxy with MCP backends — using Kyverno CEL policies to enforce controls on AI agent tool calls; and leveraging the AI Governance Proxy as a LiteLLM authorization provider to apply Kyverno CEL policy enforcement on LLM gateway requests.
+type: application
+version: 0.1.0
+appVersion: "v1"
+keywords:
+  - ai
+  - governance
+  - kyverno
+  - litellm
+  - policy
+  - authz-provider
+  - mcp
+home: https://github.com/nirmata/ai-governance-proxy
+maintainers:
+  - name: Nirmata AI Platform
+    email: support@nirmata.com

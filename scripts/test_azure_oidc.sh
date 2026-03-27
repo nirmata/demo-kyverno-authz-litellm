@@ -19,6 +19,9 @@
 #   - custom_auth.py v10 deployed (oid claim support)
 #   - litellm-jwt-config ConfigMap pointing to Azure AD JWKS
 #
+# After a LiteLLM DB / PVC reset, recreate teams + keys (master key only):
+#   bash scripts/bootstrap_litellm_teams_keys.sh
+#
 # Usage:
 #   export PROXY_MASTER_KEY="sk-..."
 #
@@ -165,6 +168,9 @@ echo ""
 if [[ "$CREATE_KEYS" == "true" ]]; then
   section "Creating teams and virtual keys"
 
+  # Unique suffix avoids "Key with alias already exists" on repeat runs
+  KEY_ALIAS_SUFFIX="${KEY_ALIAS_SUFFIX:-$(date +%s)}"
+
   echo "  Creating team-a (gemini only)..."
   TEAM_A_ID=$(curl -s -X POST "${LITELLM_URL}/team/new" \
     -H "Authorization: Bearer ${PROXY_MASTER_KEY}" \
@@ -203,7 +209,7 @@ if [[ "$CREATE_KEYS" == "true" ]]; then
   KEY_ANUDEEP_A=$(curl -s -X POST "${LITELLM_URL}/key/generate" \
     -H "Authorization: Bearer ${PROXY_MASTER_KEY}" \
     -H "Content-Type: application/json" \
-    -d "{\"team_id\":\"${TEAM_A_ID}\",\"user_id\":\"${OID_ANUDEEP}\",\"models\":[\"gemini-flash\"],\"duration\":\"30d\",\"key_alias\":\"anudeep-team-a\"}" \
+    -d "{\"team_id\":\"${TEAM_A_ID}\",\"user_id\":\"${OID_ANUDEEP}\",\"models\":[\"gemini-flash\"],\"duration\":\"30d\",\"key_alias\":\"anudeep-team-a-${KEY_ALIAS_SUFFIX}\"}" \
     | python3 -c "import json,sys; print(json.load(sys.stdin)['key'])")
   echo "    key: ${KEY_ANUDEEP_A}"
 
@@ -211,7 +217,7 @@ if [[ "$CREATE_KEYS" == "true" ]]; then
   KEY_SACHIN_B=$(curl -s -X POST "${LITELLM_URL}/key/generate" \
     -H "Authorization: Bearer ${PROXY_MASTER_KEY}" \
     -H "Content-Type: application/json" \
-    -d "{\"team_id\":\"${TEAM_B_ID}\",\"user_id\":\"${OID_SACHIN}\",\"models\":[\"claude-sonnet-4-5\"],\"duration\":\"30d\",\"key_alias\":\"sachin-team-b\"}" \
+    -d "{\"team_id\":\"${TEAM_B_ID}\",\"user_id\":\"${OID_SACHIN}\",\"models\":[\"claude-sonnet-4-5\"],\"duration\":\"30d\",\"key_alias\":\"sachin-team-b-${KEY_ALIAS_SUFFIX}\"}" \
     | python3 -c "import json,sys; print(json.load(sys.stdin)['key'])")
   echo "    key: ${KEY_SACHIN_B}"
 
@@ -219,7 +225,7 @@ if [[ "$CREATE_KEYS" == "true" ]]; then
   KEY_ANUDEEP_C=$(curl -s -X POST "${LITELLM_URL}/key/generate" \
     -H "Authorization: Bearer ${PROXY_MASTER_KEY}" \
     -H "Content-Type: application/json" \
-    -d "{\"team_id\":\"${TEAM_C_ID}\",\"user_id\":\"${OID_ANUDEEP}\",\"models\":[\"gemini-flash\",\"claude-sonnet-4-5\"],\"duration\":\"30d\",\"key_alias\":\"anudeep-team-c\"}" \
+    -d "{\"team_id\":\"${TEAM_C_ID}\",\"user_id\":\"${OID_ANUDEEP}\",\"models\":[\"gemini-flash\",\"claude-sonnet-4-5\"],\"duration\":\"30d\",\"key_alias\":\"anudeep-team-c-${KEY_ALIAS_SUFFIX}\"}" \
     | python3 -c "import json,sys; print(json.load(sys.stdin)['key'])")
   echo "    key: ${KEY_ANUDEEP_C}"
 
@@ -227,7 +233,7 @@ if [[ "$CREATE_KEYS" == "true" ]]; then
   KEY_RAHUL_D=$(curl -s -X POST "${LITELLM_URL}/key/generate" \
     -H "Authorization: Bearer ${PROXY_MASTER_KEY}" \
     -H "Content-Type: application/json" \
-    -d "{\"team_id\":\"${TEAM_D_ID}\",\"user_id\":\"${OID_RAHUL}\",\"models\":[\"gemini-flash\",\"claude-sonnet-4-5\"],\"duration\":\"30d\",\"key_alias\":\"rahul-team-d\"}" \
+    -d "{\"team_id\":\"${TEAM_D_ID}\",\"user_id\":\"${OID_RAHUL}\",\"models\":[\"gemini-flash\",\"claude-sonnet-4-5\"],\"duration\":\"30d\",\"key_alias\":\"rahul-team-d-${KEY_ALIAS_SUFFIX}\"}" \
     | python3 -c "import json,sys; print(json.load(sys.stdin)['key'])")
   echo "    key: ${KEY_RAHUL_D}"
 

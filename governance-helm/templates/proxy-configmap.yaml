@@ -1,0 +1,148 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "governance.fullname" . }}-config
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "governance.labels" . | nindent 4 }}
+data:
+  config.yaml: |
+    proxy:
+      mode: {{ .Values.proxy.mode | quote }}
+      listenAddr: {{ .Values.proxy.listenAddr | quote }}
+      adminAddr: {{ .Values.proxy.adminAddr | quote }}
+      authzAddr: {{ .Values.proxy.authzAddr | quote }}
+      httpAuthzAddr: {{ .Values.proxy.httpAuthzAddr | quote }}
+      {{- if .Values.proxy.agentServiceAccount }}
+      agentServiceAccount: {{ .Values.proxy.agentServiceAccount | quote }}
+      {{- end }}
+
+    platform:
+      url: {{ .Values.platform.url | quote }}
+      timeoutSeconds: {{ .Values.platform.timeoutSeconds }}
+      {{- if .Values.platform.clusterID }}
+      clusterID: {{ .Values.platform.clusterID | quote }}
+      {{- end }}
+
+    identity:
+      validationMode: {{ .Values.identity.validationMode | quote }}
+      allowAnonymous: {{ .Values.identity.allowAnonymous | default false }}
+      userTokenHeader: {{ .Values.identity.userTokenHeader | quote }}
+      jwksCacheTTLSeconds: {{ .Values.identity.jwksCacheTTLSeconds }}
+      agentCacheTTLSeconds: {{ .Values.identity.agentCacheTTLSeconds }}
+      {{- if .Values.identity.clusterOIDCIssuer }}
+      clusterOIDCIssuer: {{ .Values.identity.clusterOIDCIssuer | quote }}
+      {{- end }}
+      {{- if .Values.identity.oidcProviders }}
+      oidcProviders:
+        {{- toYaml .Values.identity.oidcProviders | nindent 8 }}
+      {{- else }}
+      oidcProviders: []
+      {{- end }}
+      tokenExchange:
+        enabled: {{ .Values.identity.tokenExchange.enabled }}
+        {{- if .Values.identity.tokenExchange.issuer }}
+        issuer: {{ .Values.identity.tokenExchange.issuer | quote }}
+        {{- end }}
+        {{- if .Values.identity.tokenExchange.privateKeyPath }}
+        privateKeyPath: {{ .Values.identity.tokenExchange.privateKeyPath | quote }}
+        {{- end }}
+        tokenTTLSeconds: {{ .Values.identity.tokenExchange.tokenTTLSeconds }}
+
+    policy:
+      failOpen: {{ .Values.policy.failOpen }}
+      cacheTTLSeconds: {{ .Values.policy.cacheTTLSeconds }}
+      {{- if .Values.policy.sources }}
+      sources:
+        {{- toYaml .Values.policy.sources | nindent 8 }}
+      {{- end }}
+
+    {{- $ds := list }}
+    {{- if .Values.postgres.enabled }}
+    {{- $ds = append $ds (dict "name" "postgres" "type" "mcp" "url" (printf "http://postgres-mcp:%d/sse" (.Values.postgres.mcp.port | int))) }}
+    {{- end }}
+    {{- if .Values.prometheus.enabled }}
+    {{- $ds = append $ds (dict "name" "prometheus" "type" "mcp" "url" (printf "http://prometheus-mcp:%d/sse" (.Values.prometheus.mcp.port | int))) }}
+    {{- end }}
+    {{- if $ds }}
+    datasources:
+      {{- toYaml $ds | nindent 6 }}
+    {{- end }}
+
+    {{- if .Values.content.plugins }}
+    content:
+      plugins:
+        {{- toYaml .Values.content.plugins | nindent 8 }}
+    {{- end }}
+
+    hitl:
+      defaultTimeoutMinutes: {{ .Values.hitl.defaultTimeoutMinutes }}
+      sessionAffinityEnabled: {{ .Values.hitl.sessionAffinityEnabled }}
+      timeoutAction: {{ .Values.hitl.timeoutAction | quote }}
+
+    budget:
+      checkEnabled: {{ .Values.budget.checkEnabled }}
+      window: {{ .Values.budget.window | quote }}
+      windowedQueryCacheTTLSeconds: {{ .Values.budget.windowedQueryCacheTTLSeconds }}
+
+    toolCache:
+      enabled: {{ .Values.toolCache.enabled }}
+      maxEntries: {{ .Values.toolCache.maxEntries }}
+      {{- if .Values.toolCache.servers }}
+      servers:
+        {{- toYaml .Values.toolCache.servers | nindent 8 }}
+      {{- else }}
+      {{- $servers := list }}
+      {{- if .Values.postgres.enabled }}
+      {{- $servers = append $servers (dict "url" (printf "http://postgres-mcp:%d/sse" (.Values.postgres.mcp.port | int)) "defaultTTLSeconds" (.Values.postgres.toolCache.defaultTTLSeconds | int) "tools" .Values.postgres.toolCache.tools) }}
+      {{- end }}
+      {{- if .Values.prometheus.enabled }}
+      {{- $servers = append $servers (dict "url" (printf "http://prometheus-mcp:%d/sse" (.Values.prometheus.mcp.port | int)) "defaultTTLSeconds" (.Values.prometheus.toolCache.defaultTTLSeconds | int) "tools" .Values.prometheus.toolCache.tools) }}
+      {{- end }}
+      {{- if $servers }}
+      servers:
+        {{- toYaml $servers | nindent 8 }}
+      {{- else }}
+      servers: []
+      {{- end }}
+      {{- end }}
+
+    audit:
+      bufferSize: {{ .Values.audit.bufferSize }}
+      flushIntervalSeconds: {{ .Values.audit.flushIntervalSeconds }}
+      batchSize: {{ .Values.audit.batchSize }}
+      dropOnFull: {{ .Values.audit.dropOnFull }}
+
+    {{- if .Values.storage.enabled }}
+    storage:
+      enabled: true
+      dataDir: {{ .Values.storage.dataDir | quote }}
+      auditRetentionDays: {{ .Values.storage.auditRetentionDays }}
+    {{- end }}
+
+    ui:
+      enabled: {{ .Values.ui.enabled }}
+      {{- if .Values.ui.passwordHash }}
+      passwordHash: {{ .Values.ui.passwordHash | quote }}
+      {{- end }}
+      sessionTTLHours: {{ .Values.ui.sessionTTLHours }}
+
+    observability:
+      logLevel: {{ .Values.observability.logLevel | quote }}
+      otelEndpoint: {{ .Values.observability.otelEndpoint | quote }}
+      metricsPath: {{ .Values.observability.metricsPath | quote }}
+{{- if .Values.policies }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "governance.fullname" . }}-policies
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "governance.labels" . | nindent 4 }}
+data:
+  {{- range $filename, $content := .Values.policies }}
+  {{ $filename }}: |
+    {{- $content | nindent 4 }}
+  {{- end }}
+{{- end }}

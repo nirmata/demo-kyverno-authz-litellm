@@ -1,0 +1,37 @@
+============================================================
+  AI Governance Proxy — deployed to {{ .Release.Namespace }}
+============================================================
+
+Proxy Mode: {{ .Values.proxy.mode }}
+
+Services:
+  MCP (agent-facing):   ai-governance-proxy:{{ .Values.proxy.service.mcpPort }}
+  Admin / UI / Metrics: ai-governance-proxy:{{ .Values.proxy.service.adminPort }}
+  gRPC ext_authz:       ai-governance-proxy:{{ .Values.proxy.service.authzGrpcPort }}
+  HTTP authz:           ai-governance-proxy:{{ .Values.proxy.service.authzHttpPort }}
+
+Backends:
+{{- if .Values.postgres.enabled }}
+  PostgreSQL:     postgres:{{ .Values.postgres.database.port }}
+  Postgres MCP:   postgres-mcp:{{ .Values.postgres.mcp.port }}
+{{- end }}
+{{- if .Values.prometheus.enabled }}
+  Prometheus:     prometheus:{{ .Values.prometheus.server.port }}
+  Prometheus MCP: prometheus-mcp:{{ .Values.prometheus.mcp.port }}
+{{- end }}
+{{- if .Values.presidio.enabled }}
+  Presidio:       presidio-analyzer:{{ .Values.presidio.analyzer.port }}
+{{- end }}
+
+Web UI:
+  kubectl port-forward svc/ai-governance-proxy {{ .Values.proxy.service.adminPort }}:{{ .Values.proxy.service.adminPort }} -n {{ .Release.Namespace }}
+  Then open: http://localhost:{{ .Values.proxy.service.adminPort }}/ui
+
+Policies loaded: {{ len .Values.policies }} file(s)
+{{- range $name, $_ := .Values.policies }}
+  - {{ $name }}
+{{- end }}
+
+Quick test (from inside cluster):
+  kubectl run curl-test --image=curlimages/curl --rm -it --restart=Never -n {{ .Release.Namespace }} -- \
+    curl -s http://ai-governance-proxy:{{ .Values.proxy.service.adminPort }}/healthz

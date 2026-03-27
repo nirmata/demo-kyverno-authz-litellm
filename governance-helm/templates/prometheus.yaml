@@ -1,0 +1,127 @@
+{{- if .Values.prometheus.enabled }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: prometheus
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 15s
+    scrape_configs:
+      - job_name: governance-proxy
+        metrics_path: {{ .Values.observability.metricsPath }}
+        static_configs:
+          - targets: ['ai-governance-proxy:{{ .Values.proxy.service.adminPort }}']
+      - job_name: prometheus
+        static_configs:
+          - targets: ['localhost:{{ .Values.prometheus.server.port }}']
+      {{- range .Values.prometheus.server.extraScrapeConfigs }}
+      - {{ toYaml . | nindent 8 }}
+      {{- end }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: prometheus
+    {{- include "governance.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: prometheus
+  template:
+    metadata:
+      labels:
+        app: prometheus
+    spec:
+      containers:
+        - name: prometheus
+          image: {{ .Values.prometheus.server.image }}
+          args:
+            - "--config.file=/etc/prometheus/prometheus.yml"
+            - "--storage.tsdb.path=/prometheus"
+            - "--web.console.libraries=/usr/share/prometheus/console_libraries"
+            - "--web.console.templates=/usr/share/prometheus/consoles"
+          ports:
+            - containerPort: {{ .Values.prometheus.server.port }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/prometheus/prometheus.yml
+              subPath: prometheus.yml
+          resources:
+            {{- toYaml .Values.prometheus.server.resources | nindent 12 }}
+      volumes:
+        - name: config
+          configMap:
+            name: prometheus-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: prometheus
+spec:
+  selector:
+    app: prometheus
+  ports:
+    - port: {{ .Values.prometheus.server.port }}
+      targetPort: {{ .Values.prometheus.server.port }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus-mcp
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: prometheus-mcp
+    {{- include "governance.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: prometheus-mcp
+  template:
+    metadata:
+      labels:
+        app: prometheus-mcp
+    spec:
+      containers:
+        - name: prometheus-mcp
+          image: {{ .Values.prometheus.mcp.image }}
+          env:
+            - name: PROMETHEUS_URL
+              value: "http://prometheus:{{ .Values.prometheus.server.port }}"
+            - name: PROMETHEUS_MCP_SERVER_TRANSPORT
+              value: "sse"
+            - name: PROMETHEUS_MCP_BIND_HOST
+              value: "0.0.0.0"
+            - name: PROMETHEUS_MCP_BIND_PORT
+              value: {{ .Values.prometheus.mcp.port | quote }}
+          ports:
+            - containerPort: {{ .Values.prometheus.mcp.port }}
+          resources:
+            {{- toYaml .Values.prometheus.mcp.resources | nindent 12 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus-mcp
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: prometheus-mcp
+spec:
+  selector:
+    app: prometheus-mcp
+  ports:
+    - port: {{ .Values.prometheus.mcp.port }}
+      targetPort: {{ .Values.prometheus.mcp.port }}
+{{- end }}

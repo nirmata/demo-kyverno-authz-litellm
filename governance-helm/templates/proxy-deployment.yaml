@@ -1,0 +1,161 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "governance.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "governance.labels" . | nindent 4 }}
+spec:
+  {{- if not .Values.proxy.autoscaling.enabled }}
+  replicas: {{ .Values.proxy.replicaCount }}
+  {{- end }}
+  selector:
+    matchLabels:
+      app: ai-governance-proxy
+      {{- include "governance.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/proxy-configmap.yaml") . | sha256sum }}
+        {{- with .Values.proxy.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        app: ai-governance-proxy
+        {{- include "governance.selectorLabels" . | nindent 8 }}
+    spec:
+      {{- with .Values.proxy.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "governance.fullname" . }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        fsGroup: 65534
+      containers:
+        - name: proxy
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+          image: {{ include "governance.proxy.image" . }}
+          imagePullPolicy: {{ .Values.proxy.image.pullPolicy }}
+          args:
+            - --config
+            - /etc/proxy/config.yaml
+            {{- if eq .Values.proxy.mode "sidecar" }}
+            {{- if .Values.proxy.agentServiceAccount }}
+            - --agent-sa
+            - {{ .Values.proxy.agentServiceAccount | quote }}
+            {{- end }}
+            {{- end }}
+          ports:
+            - name: mcp
+              containerPort: 8080
+              protocol: TCP
+            - name: admin
+              containerPort: 8081
+              protocol: TCP
+            - name: authz-grpc
+              containerPort: 9081
+              protocol: TCP
+            - name: authz-http
+              containerPort: 9082
+              protocol: TCP
+          env:
+            {{- if .Values.platform.clusterID }}
+            - name: PROXY_CLUSTER_ID
+              value: {{ .Values.platform.clusterID | quote }}
+            {{- end }}
+            {{- if .Values.platform.authTokenSecret }}
+            - name: PROXY_PLATFORM_AUTHTOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.platform.authTokenSecret }}
+                  key: {{ .Values.platform.authTokenSecretKey }}
+            {{- else if .Values.platform.authToken }}
+            - name: PROXY_PLATFORM_AUTHTOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "governance.fullname" . }}-platform-token
+                  key: token
+            {{- end }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: admin
+            initialDelaySeconds: 5
+            periodSeconds: 15
+            timeoutSeconds: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: admin
+            initialDelaySeconds: 3
+            periodSeconds: 10
+            timeoutSeconds: 3
+          resources:
+            {{- toYaml .Values.proxy.resources | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/proxy/config.yaml
+              subPath: config.yaml
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+            {{- if .Values.policies }}
+            - name: policies
+              mountPath: /etc/proxy/policies
+              readOnly: true
+            {{- end }}
+            {{- if .Values.storage.persistence.enabled }}
+            - name: data
+              mountPath: {{ .Values.storage.dataDir }}
+            {{- end }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "governance.fullname" . }}-config
+        - name: tmp
+          emptyDir: {}
+        {{- if .Values.policies }}
+        - name: policies
+          configMap:
+            name: {{ include "governance.fullname" . }}-policies
+        {{- end }}
+        {{- if .Values.storage.persistence.enabled }}
+        - name: data
+          persistentVolumeClaim:
+            claimName: {{ include "governance.fullname" . }}-data
+        {{- end }}
+      {{- with .Values.proxy.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.proxy.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.proxy.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- if .Values.storage.persistence.enabled }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "governance.fullname" . }}-data
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "governance.labels" . | nindent 4 }}
+spec:
+  accessModes: [ReadWriteOnce]
+  {{- if .Values.storage.persistence.storageClass }}
+  storageClassName: {{ .Values.storage.persistence.storageClass | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.storage.persistence.size }}
+{{- end }}

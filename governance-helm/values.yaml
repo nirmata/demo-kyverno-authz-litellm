@@ -1,0 +1,455 @@
+# ============================================================================
+# AI Governance Proxy — Helm Values
+# ============================================================================
+
+# ── Governance Proxy ─────────────────────────────────────────────────────────
+proxy:
+  replicaCount: 1
+  image:
+    repository: anuddeeph/ai-governance-proxy
+    tag: "v2-sse-fix"
+    pullPolicy: Always
+  imagePullSecrets: []
+
+  mode: standalone         # standalone | sidecar | authz-provider
+  listenAddr: ":8080"
+  adminAddr: ":8081"
+  authzAddr: ":9081"
+  httpAuthzAddr: ":9082"
+  agentServiceAccount: ""
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+  service:
+    type: ClusterIP
+    mcpPort: 8080
+    adminPort: 8081
+    authzGrpcPort: 9081
+    authzHttpPort: 9082
+
+  ingress:
+    enabled: false
+    className: ""
+    annotations: {}
+    hosts: []
+    tls: []
+
+  autoscaling:
+    enabled: false
+    minReplicas: 1
+    maxReplicas: 5
+    targetCPUUtilizationPercentage: 80
+
+  podAnnotations: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+# ── Nirmata Platform (optional) ─────────────────────────────────────────────
+platform:
+  url: ""
+  authToken: ""
+  authTokenSecret: ""
+  authTokenSecretKey: "token"
+  timeoutSeconds: 5
+  clusterID: ""
+
+# ── Identity ─────────────────────────────────────────────────────────────────
+identity:
+  validationMode: cel      # oidc | cel
+  allowAnonymous: true
+  userTokenHeader: "X-User-Token"
+  jwksCacheTTLSeconds: 300
+  agentCacheTTLSeconds: 60
+  clusterOIDCIssuer: ""
+  oidcProviders: []
+  # oidcProviders:
+  #   - name: azure-ad
+  #     issuer: "https://login.microsoftonline.com/TENANT/v2.0"
+  #     audience: "CLIENT_ID"
+  #     jwksURL: ""
+  tokenExchange:
+    enabled: false
+    issuer: ""
+    privateKeyPath: ""
+    tokenTTLSeconds: 900
+
+# ── Policy Engine ────────────────────────────────────────────────────────────
+policy:
+  failOpen: false
+  cacheTTLSeconds: 10
+  sources:
+    - type: file
+      path: /etc/proxy/policies
+
+# ── HITL (Human-in-the-Loop) ─────────────────────────────────────────────────
+hitl:
+  defaultTimeoutMinutes: 5
+  sessionAffinityEnabled: true
+  timeoutAction: deny      # deny | audit
+
+# ── Budget Enforcement ───────────────────────────────────────────────────────
+budget:
+  checkEnabled: false
+  window: "1h"
+  windowedQueryCacheTTLSeconds: 10
+
+# ── Tool Response Cache ──────────────────────────────────────────────────────
+toolCache:
+  enabled: true
+  maxEntries: 10000
+  # servers are auto-populated from datasources if left empty
+  servers: []
+
+# ── Audit ────────────────────────────────────────────────────────────────────
+audit:
+  bufferSize: 10000
+  flushIntervalSeconds: 2
+  batchSize: 100
+  dropOnFull: true
+
+# ── Storage (SQLite) ─────────────────────────────────────────────────────────
+storage:
+  enabled: true
+  dataDir: /data
+  auditRetentionDays: 30
+  persistence:
+    enabled: true
+    storageClass: ""       # uses default StorageClass (gp3)
+    size: 2Gi
+
+# ── Observability ────────────────────────────────────────────────────────────
+observability:
+  logLevel: debug
+  otelEndpoint: ""
+  metricsPath: /metrics
+
+# ── Web UI ───────────────────────────────────────────────────────────────────
+ui:
+  enabled: true
+  # Password: admin123 (Go bcrypt $2a$ hash)
+  passwordHash: "$2a$10$PxXvXkW4i10fMWMXF.CINeA13V5RfoQTsAzGoKWyr2lLnhZvRPkPG"
+  sessionTTLHours: 8
+
+# ── Content Safety Plugins (optional) ────────────────────────────────────────
+content:
+  plugins: []
+  # plugins:
+  #   - name: presidio
+  #     endpoint: http://presidio-analyzer:3000
+  #     timeoutSeconds: 2
+  #     failOpen: true
+
+# ── Presidio (PII detection — optional) ──────────────────────────────────────
+presidio:
+  enabled: false
+  analyzer:
+    image: mcr.microsoft.com/presidio-analyzer:latest
+    port: 3000
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+
+# ============================================================================
+# MCP Backend Datasources
+# ============================================================================
+# Each datasource is independently toggleable.
+# The proxy's config.datasources and toolCache.servers are auto-built from
+# enabled datasources below.
+
+# ── PostgreSQL + Postgres MCP ────────────────────────────────────────────────
+postgres:
+  enabled: true
+  database:
+    image: postgres:16-alpine
+    name: appdb
+    user: appuser
+    password: apppass
+    port: 5432
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+    persistence:
+      enabled: true
+      storageClass: ""
+      size: 5Gi
+  mcp:
+    image: crystaldba/postgres-mcp:latest
+    port: 8000
+    resources:
+      requests:
+        cpu: 50m
+        memory: 64Mi
+      limits:
+        cpu: 200m
+        memory: 256Mi
+  toolCache:
+    defaultTTLSeconds: 30
+    tools:
+      - name: list_schemas
+        ttlSeconds: 300
+      - name: list_objects
+        ttlSeconds: 300
+      - name: get_object_details
+        ttlSeconds: 300
+      - name: analyze_db_health
+        ttlSeconds: 120
+      - name: execute_sql
+        ttlSeconds: 30
+
+# ── Prometheus + Prometheus MCP ──────────────────────────────────────────────
+prometheus:
+  enabled: true
+  server:
+    image: prom/prometheus:v2.52.0
+    port: 9090
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+    persistence:
+      enabled: false
+    # Extra scrape targets added automatically (governance proxy metrics)
+    extraScrapeConfigs: []
+  mcp:
+    image: ghcr.io/pab1it0/prometheus-mcp-server:latest
+    port: 3000
+    resources:
+      requests:
+        cpu: 50m
+        memory: 64Mi
+      limits:
+        cpu: 200m
+        memory: 256Mi
+  toolCache:
+    defaultTTLSeconds: 60
+    tools:
+      - name: query
+        ttlSeconds: 30
+      - name: query_range
+        ttlSeconds: 120
+
+# ============================================================================
+# Kyverno CEL Policies
+# ============================================================================
+# Key = filename, Value = full policy YAML.
+# Mounted at /etc/proxy/policies/ inside the proxy container.
+
+policies:
+  # 1. Block DDL operations unconditionally
+  block-ddl.yaml: |
+    apiVersion: policies.kyverno.io/v1alpha1
+    kind: ValidatingPolicy
+    metadata:
+      name: block-ddl
+      annotations:
+        proxy.nirmata.io/enforcement-mode: deny
+    spec:
+      evaluation:
+        mode: JSON
+      matchConditions:
+        - name: is-ddl
+          expression: >
+            object.tool.name == "create_table" ||
+            object.tool.name == "drop_table"   ||
+            object.tool.name == "create_index" ||
+            object.tool.name == "drop_index"   ||
+            (
+              object.tool.arguments.exists(k, k == "sql") &&
+              (
+                object.tool.arguments["sql"].upperAscii().startsWith("CREATE")   ||
+                object.tool.arguments["sql"].upperAscii().startsWith("DROP")     ||
+                object.tool.arguments["sql"].upperAscii().startsWith("ALTER")    ||
+                object.tool.arguments["sql"].upperAscii().startsWith("TRUNCATE")
+              )
+            )
+      validations:
+        - expression: "false"
+          message: "DDL operations are blocked by governance policy."
+
+  # 2. Block queries referencing PII columns
+  block-pii.yaml: |
+    apiVersion: policies.kyverno.io/v1alpha1
+    kind: ValidatingPolicy
+    metadata:
+      name: block-pii-access
+      annotations:
+        proxy.nirmata.io/enforcement-mode: deny
+    spec:
+      evaluation:
+        mode: JSON
+      matchConditions:
+        - name: has-sql
+          expression: >
+            object.tool.arguments.exists(k, k == "sql")
+      validations:
+        - expression: >
+            !object.tool.arguments["sql"].lowerAscii().contains("ssn")         &&
+            !object.tool.arguments["sql"].lowerAscii().contains("credit_card") &&
+            !object.tool.arguments["sql"].lowerAscii().contains("password")    &&
+            !object.tool.arguments["sql"].lowerAscii().contains("secret")
+          message: "Query references PII/sensitive column. Access denied."
+
+  # 3. Require human approval for destructive tool calls
+  require-approval-destructive.yaml: |
+    apiVersion: policies.kyverno.io/v1alpha1
+    kind: ValidatingPolicy
+    metadata:
+      name: require-approval-destructive
+      annotations:
+        proxy.nirmata.io/enforcement-mode: Fail
+    spec:
+      evaluation:
+        mode: JSON
+      matchConditions:
+        - name: is-destructive
+          expression: >
+            object.tool.name.matches("(?i)(delete|drop|truncate|\\brm\\b|destroy)")
+      validations:
+        - expression: "false"
+          message: "Destructive tool call requires human approval"
+      requireApproval:
+        timeoutMinutes: 5
+        timeoutAction: Deny
+
+  # 4. Require approval for DML writes
+  require-approval-writes.yaml: |
+    apiVersion: policies.kyverno.io/v1alpha1
+    kind: ValidatingPolicy
+    metadata:
+      name: require-approval-writes
+      annotations:
+        proxy.nirmata.io/enforcement-mode: require-approval
+    spec:
+      evaluation:
+        mode: JSON
+      matchConditions:
+        - name: is-dml-write
+          expression: >
+            object.tool.arguments.exists(k, k == "sql") &&
+            (
+              object.tool.arguments["sql"].upperAscii().startsWith("INSERT") ||
+              object.tool.arguments["sql"].upperAscii().startsWith("UPDATE") ||
+              object.tool.arguments["sql"].upperAscii().startsWith("DELETE")
+            )
+      validations:
+        - expression: "false"
+          message: "Write operations require human approval"
+
+  # 5. Audit all writes (allow but log)
+  # Renamed to z-audit so it loads AFTER require-approval-writes
+  z-audit-writes.yaml: |
+    apiVersion: policies.kyverno.io/v1alpha1
+    kind: ValidatingPolicy
+    metadata:
+      name: audit-all-writes
+      annotations:
+        proxy.nirmata.io/enforcement-mode: audit
+    spec:
+      evaluation:
+        mode: JSON
+      matchConditions:
+        - name: is-write
+          expression: >
+            object.tool.arguments.exists(k, k == "sql") &&
+            (
+              object.tool.arguments["sql"].upperAscii().startsWith("INSERT") ||
+              object.tool.arguments["sql"].upperAscii().startsWith("UPDATE") ||
+              object.tool.arguments["sql"].upperAscii().startsWith("DELETE")
+            )
+      validations:
+        - expression: "false"
+          message: "Write operation — flagged for audit"
+
+  # 6. Allow all SELECT queries
+  allow-reads.yaml: |
+    apiVersion: policies.kyverno.io/v1alpha1
+    kind: ValidatingPolicy
+    metadata:
+      name: allow-read-queries
+    spec:
+      evaluation:
+        mode: JSON
+      matchConditions:
+        - name: is-select
+          expression: >
+            object.tool.arguments.exists(k, k == "sql") &&
+            object.tool.arguments["sql"].upperAscii().startsWith("SELECT")
+      validations:
+        - expression: "true"
+          message: "Read queries are allowed"
+
+  # ========================================================================
+  # LiteLLM Authz Policies (POST /authz/litellm)
+  # ========================================================================
+  # These fire only on LiteLLM requests (identified by "model" in arguments).
+  # They do NOT affect MCP tool-call policies above.
+
+  # 7. Require a delegating user identity for all LLM inference calls
+  litellm-require-identity.yaml: |
+    apiVersion: policies.kyverno.io/v1alpha1
+    kind: ValidatingPolicy
+    metadata:
+      name: litellm-require-user-identity
+      annotations:
+        proxy.nirmata.io/enforcement-mode: deny
+    spec:
+      evaluation:
+        mode: JSON
+      matchConditions:
+        - name: is-litellm-inference
+          expression: >
+            object.tool.arguments.exists(k, k == "model") &&
+            object.tool.arguments["model"] != ""
+      validations:
+        - expression: "object.user.isPresent"
+          message: >
+            All LLM inference calls require a delegating user identity.
+            Pass an Azure AD JWT in the X-Identity-Token header.
+
+  # 8. Restrict premium models to specific groups (audit mode — logs but does not block)
+  litellm-restrict-models.yaml: |
+    apiVersion: policies.kyverno.io/v1alpha1
+    kind: ValidatingPolicy
+    metadata:
+      name: litellm-restrict-premium-models
+      annotations:
+        proxy.nirmata.io/enforcement-mode: audit
+    spec:
+      evaluation:
+        mode: JSON
+      matchConditions:
+        - name: is-litellm-premium-model
+          expression: >
+            object.tool.arguments.exists(k, k == "model") &&
+            object.tool.arguments["model"] in [
+              "claude-sonnet-4-5",
+              "claude-opus-4-5",
+              "gpt-4o",
+              "o1",
+              "o3"
+            ]
+      validations:
+        - expression: >
+            object.user.isPresent &&
+            object.user.groups.exists(g, g == "ml-team" || g == "ai-platform")
+          message: >
+            Premium models (claude-sonnet-4-5, gpt-4o, o1, o3) require membership
+            in the ml-team or ai-platform group.
