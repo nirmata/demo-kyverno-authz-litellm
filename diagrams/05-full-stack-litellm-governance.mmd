@@ -1,0 +1,67 @@
+%% LiteLLM + AI Governance Proxy — same layout intent as governance-helm/architecture.png
+flowchart TB
+    subgraph z_clients["Clients"]
+        direction TB
+        REST["API / UI clients\nBearer sk- + X-Identity-Token"]
+        MCP_AGENTS["AI agents MCP\nClaude · Cursor · custom"]
+    end
+
+    subgraph z_azure["Identity"]
+        AAD["Azure AD Entra ID\nJWKS + OIDC"]
+    end
+
+    subgraph ns_litellm["Namespace: litellm"]
+        direction TB
+        LLM["LiteLLM proxy\ncustom_auth.py · PyJWT"]
+        LSTORE[("PostgreSQL\nkeys · teams · spend")]
+        LREDIS[("Redis")]
+        LLM --- LSTORE
+        LLM --- LREDIS
+    end
+
+    subgraph ns_gov["Namespace: governance — AI Governance Proxy"]
+        direction TB
+        IMG["anuddeeph/ai-governance-proxy:v2-sse-fix\nproxy.mode authz-provider"]
+        PORTS["Ports: :8080 MCP/SSE · :8081 Admin UI + /authz/litellm · :9081 gRPC authz · :9082 HTTP authz"]
+        ST1["1 Identity OIDC / CEL"]
+        ST2["2 Policy Kyverno CEL"]
+        ST3["3 HITL gate"]
+        ST4["4 Tool response cache"]
+        ST5["5 Forward to MCP backend"]
+        ST6["6 Audit + Prometheus metrics"]
+        IMG --> PORTS
+        PORTS --> ST1
+        ST1 --> ST2 --> ST3 --> ST4 --> ST5 --> ST6
+        SQLITE[("SQLite\naudit · HITL queue")]
+        POL["ConfigMap Kyverno CEL policies\n+ values-authz litellmPolicies"]
+        ST6 --- SQLITE
+        ST2 --- POL
+    end
+
+    subgraph z_mcp_back["MCP backends Helm chart"]
+        direction TB
+        PG_MCP["Postgres MCP SSE"]
+        PG_DB[("PostgreSQL 16")]
+        PROM_MCP["Prometheus MCP SSE"]
+        PROM_TS[("Prometheus TSDB")]
+        PG_MCP --> PG_DB
+        PROM_MCP --> PROM_TS
+    end
+
+    subgraph z_llm_up["Upstream LLM APIs"]
+        UP["Gemini · Anthropic · …"]
+    end
+
+    subgraph z_admin["Web UI / ops"]
+        UI["Browser: policies · audit log · HITL approvals · health"]
+    end
+
+    REST --> LLM
+    LLM -->|"JWT verify"| AAD
+    LLM -->|"POST :8081 /authz/litellm"| ST2
+    MCP_AGENTS -->|":8080 tools/call SSE"| ST1
+    ST5 --> PG_MCP
+    ST5 --> PROM_MCP
+    LLM --> UP
+    PROM_TS -->|"/metrics scrape"| ST6
+    UI -->|":8081"| ST6

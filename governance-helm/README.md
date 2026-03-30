@@ -64,6 +64,8 @@ The proxy provides:
 
 ![Architecture Diagram](architecture.png)
 
+**LiteLLM + `values-authz.yml` (authz-provider):** the same proxy and pipeline apply; additionally **LiteLLM** (namespace `litellm`) calls **`POST /authz/litellm`** on **:8081** with identity tokens (**Azure AD** OIDC). See the combined diagram: [`architecture-litellm-authz.png`](architecture-litellm-authz.png) (source Mermaid: [`../diagrams/05-full-stack-litellm-governance.mmd`](../diagrams/05-full-stack-litellm-governance.mmd)).
+
 **Data flow:** AI agents connect via MCP/SSE to the governance proxy (:8080). Every `tools/call` passes through a 6-stage pipeline (identity → policy → HITL → cache → forward → audit). Allowed calls are forwarded to backend MCP servers (Postgres MCP, Prometheus MCP) over SSE. Prometheus scrapes the proxy's `/metrics` endpoint every 15s. The admin UI, audit log, and HITL approvals are served on :8081.
 
 ## Components

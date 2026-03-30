@@ -89,6 +89,8 @@ A production-grade AI gateway that unifies multiple LLM providers behind a singl
 ```
 AI-auth/
 ├── README.md                          # This file
+├── ARCHITECTURE.md                    # Mermaid diagrams + PNG exports under diagrams/
+├── diagrams/                          # 01–05 .mmd + .png; 05 = full stack like governance-helm poster
 ├── INSTALLATION.md                    # Step-by-step installation guide
 ├── AZURE_OIDC_INTEGRATION_PLAN.md     # Azure AD OIDC migration plan
 ├── AUTHZ_LAYER_ARCHITECTURE.md        # Authorization layer design

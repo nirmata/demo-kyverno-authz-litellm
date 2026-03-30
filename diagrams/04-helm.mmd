@@ -1,0 +1,13 @@
+flowchart LR
+    subgraph helm_litellm["litellm-helm"]
+        V1["values.yaml\nimage · custom_auth · secrets"]
+    end
+    subgraph helm_gov["governance-helm"]
+        V2["values-authz.yml\nproxy.image · oidcProviders · litellmPolicies"]
+    end
+    subgraph images["Images"]
+        I1["litellm-custom-auth\nDockerfile + custom_auth.py"]
+        I2["ai-governance-proxy\nai-governance-proxy/Dockerfile"]
+    end
+    I1 --> V1
+    I2 --> V2

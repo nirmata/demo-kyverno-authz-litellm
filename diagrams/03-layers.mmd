@@ -1,0 +1,14 @@
+flowchart LR
+    subgraph L1["1 · Identity"]
+        A1["Azure OIDC\nPyJWT + JWKS"]
+    end
+    subgraph L2["2 · Policy"]
+        A2["Governance proxy\nCEL on /authz/litellm"]
+    end
+    subgraph L3["3 · Ownership"]
+        A3["custom_auth.py\noid ↔ key.user_id"]
+    end
+    subgraph L4["4 · Access"]
+        A4["LiteLLM\nmodels · budget · teams"]
+    end
+    A1 --> A2 --> A3 --> A4

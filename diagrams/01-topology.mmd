@@ -1,0 +1,27 @@
+flowchart TB
+    subgraph clients["Clients"]
+        CLI[CLI / apps / UI]
+    end
+
+    subgraph ext["External"]
+        AAD["Azure AD Entra ID\n(JWKS + tokens)"]
+        UP["Upstream LLMs\nGemini · Anthropic · …"]
+    end
+
+    subgraph ns_litellm["Namespace: litellm"]
+        LLM["LiteLLM proxy\n(custom_auth.py)"]
+        PG[("PostgreSQL\nkeys · teams · spend")]
+        RD[("Redis\ncache")]
+        LLM --- PG
+        LLM --- RD
+    end
+
+    subgraph ns_gov["Namespace: governance"]
+        GP["AI Governance Proxy\n:8081 /authz/litellm\n(values-authz.yml)"]
+    end
+
+    CLI -->|"Authorization: Bearer sk-…\nX-Identity-Token: JWT"| LLM
+    LLM -->|"PyJWT + JWKS"| AAD
+    LLM -->|"HTTP JSON\nPOST …:8081/authz/litellm"| GP
+    GP -->|"OIDC / policy context"| AAD
+    LLM --> UP

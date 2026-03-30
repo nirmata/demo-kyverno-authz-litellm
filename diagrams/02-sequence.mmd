@@ -1,0 +1,21 @@
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant L as LiteLLM
+    participant H as custom_auth.py
+    participant J as Azure AD JWKS
+    participant G as AI Governance Proxy
+    participant D as LiteLLM DB
+    participant P as LLM provider
+
+    C->>L: POST /v1/chat/completions\nBearer sk-… + X-Identity-Token
+    L->>H: user_api_key_auth
+    H->>J: Verify JWT signature, iss, aud, exp
+    J-->>H: Claims: oid, groups, …
+    H->>G: POST /authz/litellm\n(token, model, path, identity_token)
+    G-->>H: { allow: true } or 401
+    H->>D: key owner lookup (oid vs user_id)
+    H-->>L: Return api_key string
+    L->>D: Authorize key: model, budget, team
+    L->>P: Forward completion request
+    P-->>C: Response
