@@ -8,12 +8,12 @@ replicaCount: 3
 image:
   # Use "ghcr.io/berriai/litellm-database" for optimized image with database
   #repository: docker.litellm.ai/berriai/litellm-database
-  repository: anuddeeph/litellm-custom-auth
+  repository: docker.litellm.ai/berriai/litellm-database
   pullPolicy: Always
   # Overrides the image tag whose default is the chart appVersion.
   # tag: "main-latest"
   #tag: "main-stable"
-  tag: "v11"
+  tag: "main-stable"
 imagePullSecrets: []
 nameOverride: "litellm"
 fullnameOverride: ""
@@ -110,6 +110,15 @@ masterkeySecretName: "litellm-env-secret"
 
 # if set, use this secret key for the master key; otherwise, use the default key
 masterkeySecretKey: "PROXY_MASTER_KEY"
+
+# Mount custom_auth.py from a ConfigMap at /etc/litellm/custom_auth.py (replaces baking it into the image).
+# Chart embeds auth-prototype/custom_auth.py via litellm-helm/files/custom_auth.py (symlink to repo root).
+customAuth:
+  enabled: true
+  # If set, use this existing ConfigMap instead of creating {{ fullname }}-custom-auth
+  existingConfigMap: ""
+  # Key under ConfigMap data (must match the filename LiteLLM loads as a module path segment)
+  configMapKey: custom_auth.py
 
 proxyConfigMap:
   # when true, creates a new configmap

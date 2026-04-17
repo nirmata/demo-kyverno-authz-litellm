@@ -10,10 +10,11 @@
 proxy:
   replicaCount: 1
   image:
-    repository: anuddeeph/ai-governance-proxy
-    tag: "v2-sse-fix"
+    repository: ghcr.io/nirmata/ai-governance-proxy
+    tag: latest
     pullPolicy: Always
-  imagePullSecrets: []
+  imagePullSecrets:
+  - name: ghcr-login-secret
 
   mode: authz-provider     # standalone | sidecar | authz-provider
   listenAddr: ":8080"

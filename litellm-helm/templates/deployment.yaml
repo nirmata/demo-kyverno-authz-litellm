@@ -22,6 +22,9 @@ spec:
         {{- if .Values.proxyConfigMap.create }}
         checksum/config: {{ include (print $.Template.BasePath "/configmap-litellm.yaml") . | sha256sum }}
         {{- end }}
+        {{- if and .Values.customAuth.enabled (not .Values.customAuth.existingConfigMap) }}
+        checksum/custom-auth: {{ include (print $.Template.BasePath "/configmap-custom-auth.yaml") . | sha256sum }}
+        {{- end }}
         {{- with .Values.podAnnotations }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
@@ -176,6 +179,12 @@ spec:
             - name: litellm-config
               mountPath: /etc/litellm/config.yaml
               subPath: config.yaml
+            {{- if .Values.customAuth.enabled }}
+            - name: litellm-custom-auth
+              mountPath: /etc/litellm/custom_auth.py
+              subPath: {{ .Values.customAuth.configMapKey | default "custom_auth.py" }}
+              readOnly: true
+            {{- end }}
           {{ if .Values.securityContext.readOnlyRootFilesystem }}
             - name: tmp
               mountPath: /tmp
@@ -216,6 +225,14 @@ spec:
             items:
               - key: {{ .Values.proxyConfigMap.key | default "config.yaml" }}
                 path: "config.yaml"
+        {{- if .Values.customAuth.enabled }}
+        - name: litellm-custom-auth
+          configMap:
+            name: {{ if .Values.customAuth.existingConfigMap }}{{ .Values.customAuth.existingConfigMap }}{{ else }}{{ include "litellm.fullname" . }}-custom-auth{{ end }}
+            items:
+              - key: {{ .Values.customAuth.configMapKey | default "custom_auth.py" }}
+                path: {{ .Values.customAuth.configMapKey | default "custom_auth.py" }}
+        {{- end }}
       {{- with .Values.volumes }}
         {{- toYaml . | nindent 8 }}
       {{- end }}

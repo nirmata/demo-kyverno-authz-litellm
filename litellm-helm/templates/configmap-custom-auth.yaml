@@ -1,0 +1,11 @@
+{{- if and .Values.customAuth.enabled (not .Values.customAuth.existingConfigMap) }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "litellm.fullname" . }}-custom-auth
+  labels:
+    {{- include "litellm.labels" . | nindent 4 }}
+data:
+  {{ .Values.customAuth.configMapKey | default "custom_auth.py" }}: |
+{{ .Files.Get "files/custom_auth.py" | nindent 4 }}
+{{- end }}
